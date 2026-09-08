@@ -1,0 +1,15 @@
+pub mod barcodes;
+pub mod cli;
+pub mod decoder;
+pub mod demux;
+pub mod encoder;
+pub mod fastq;
+pub(crate) mod input;
+pub(crate) mod parallel;
+pub(crate) mod parallel_input;
+pub mod routing;
+pub mod samples;
+pub mod stats;
+pub mod structure;
+pub(crate) mod thread_plan;
+pub mod writer;
