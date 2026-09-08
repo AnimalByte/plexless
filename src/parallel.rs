@@ -10,11 +10,10 @@ use flate2::write::GzEncoder;
 
 use crate::barcodes::BarcodeCatalog;
 use crate::cli::DemuxArgs;
-use crate::decoder::Decoder;
-use crate::demux::{DemuxCounts, core_read_id, decode_read, print_summary, write_fastq_stats};
+use crate::demux::{DemuxCounts, core_read_id, print_summary, write_fastq_stats};
 use crate::input::InputFiles;
 use crate::parallel_input::ParallelInput;
-use crate::routing::{RouteResult, RoutingTable};
+use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
 use crate::stats::FastqStats;
 use crate::structure::ReadLayout;
@@ -29,10 +28,7 @@ const QUEUE_DEPTH_PER_WORKER: usize = 2;
 const MAX_QUEUED_BATCHES: usize = 32;
 
 struct SharedState {
-    layout: ReadLayout,
-    barcode_symbols: Vec<u8>,
-    decoders: HashMap<u8, Decoder>,
-    routing: RoutingTable,
+    routing: RoutingTree,
     r1_prefix: usize,
     r2_prefix: usize,
     write_unassigned: bool,
@@ -356,15 +352,10 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
 
     let catalog = BarcodeCatalog::load(&args.barcodes, &layout)?;
     let samples = SampleSheet::load(&args.samples, &layout, &catalog)?;
-    let barcode_symbols = layout.barcode_symbols();
-    let decoders = build_decoders(&barcode_symbols, &catalog, args.max_mismatches)?;
-    let routing = RoutingTable::new(&samples)?;
-    let (r1_prefix, r2_prefix) = prefix_lengths(&layout);
+    let routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
+    let (r1_prefix, r2_prefix) = (routing.r1_prefix_len(), routing.r2_prefix_len());
 
     let state = SharedState {
-        layout,
-        barcode_symbols,
-        decoders,
         routing,
         r1_prefix,
         r2_prefix,
@@ -512,34 +503,6 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
     Ok(())
 }
 
-fn build_decoders(
-    barcode_symbols: &[u8],
-    catalog: &BarcodeCatalog,
-    max_mismatches: u8,
-) -> Result<HashMap<u8, Decoder>, String> {
-    let mut decoders = HashMap::new();
-
-    for &symbol in barcode_symbols {
-        let set = catalog
-            .set(symbol)
-            .ok_or_else(|| format!("Missing barcode set {}", symbol as char))?;
-
-        decoders.insert(symbol, Decoder::new(set, max_mismatches)?);
-    }
-
-    Ok(decoders)
-}
-
-fn prefix_lengths(layout: &ReadLayout) -> (usize, usize) {
-    match layout {
-        ReadLayout::Single { r1 } => (r1.as_ref().map_or(0, |value| value.prefix_len), 0),
-        ReadLayout::Paired { r1, r2 } => (
-            r1.as_ref().map_or(0, |value| value.prefix_len),
-            r2.as_ref().map_or(0, |value| value.prefix_len),
-        ),
-    }
-}
-
 fn worker_loop(
     worker_index: usize,
     receiver: Receiver<WorkBatch>,
@@ -610,14 +573,8 @@ fn process_single_record(
     buffers: &mut BatchBuffers,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let route = if let Some((calls, count)) = decode_read(
-        &state.layout,
-        &state.barcode_symbols,
-        &record.seq,
-        None,
-        &state.decoders,
-    )? {
-        state.routing.route(&calls[..count])
+    let route = if let Some(route) = state.routing.route_read(&record.seq, None)? {
+        route
     } else {
         counts.short_reads += 1;
         RouteResult::Unmatched
@@ -639,14 +596,8 @@ fn process_pair(
     buffers: &mut BatchBuffers,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let route = if let Some((calls, count)) = decode_read(
-        &state.layout,
-        &state.barcode_symbols,
-        &r1.seq,
-        Some(&r2.seq),
-        &state.decoders,
-    )? {
-        state.routing.route(&calls[..count])
+    let route = if let Some(route) = state.routing.route_read(&r1.seq, Some(&r2.seq))? {
+        route
     } else {
         counts.short_reads += 1;
         RouteResult::Unmatched

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use simplex::cli::DemuxArgs;
+use plexless::cli::DemuxArgs;
 
 use common::{TestDir, read_gzip_text};
 
@@ -98,7 +98,7 @@ fn automatic_parallel_gzip_single_end_matches_serial_reference() {
     let serial_output = test.child("serial");
     let parallel_output = test.child("parallel");
 
-    simplex::demux::run(single_args(
+    plexless::demux::run(single_args(
         reads.clone(),
         barcodes.clone(),
         samples.clone(),
@@ -106,7 +106,7 @@ fn automatic_parallel_gzip_single_end_matches_serial_reference() {
     ))
     .expect("Serial gzip demultiplexing should succeed");
 
-    simplex::demux::run_with_threads(
+    plexless::demux::run_with_threads(
         single_args(reads, barcodes, samples, parallel_output.clone()),
         8,
     )
@@ -171,7 +171,7 @@ fn automatic_parallel_gzip_paired_end_preserves_pair_resync() {
     let serial_output = test.child("serial");
     let parallel_output = test.child("parallel");
 
-    simplex::demux::run(paired_args(
+    plexless::demux::run(paired_args(
         r1.clone(),
         r2.clone(),
         barcodes.clone(),
@@ -180,7 +180,7 @@ fn automatic_parallel_gzip_paired_end_preserves_pair_resync() {
     ))
     .expect("Serial paired gzip demultiplexing should succeed");
 
-    simplex::demux::run_with_threads(
+    plexless::demux::run_with_threads(
         paired_args(r1, r2, barcodes, samples, parallel_output.clone()),
         8,
     )
@@ -237,7 +237,7 @@ fn automatic_parallel_gzip_rejects_corrupt_footer() {
     compressed[crc_index] ^= 0xff;
     fs::write(&reads, compressed).expect("Could not corrupt gzip fixture");
 
-    let error = simplex::demux::run_with_threads(
+    let error = plexless::demux::run_with_threads(
         single_args(reads, barcodes, samples, test.child("parallel")),
         8,
     )

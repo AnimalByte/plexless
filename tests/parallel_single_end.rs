@@ -1,6 +1,6 @@
 mod common;
 
-use simplex::cli::DemuxArgs;
+use plexless::cli::DemuxArgs;
 
 use common::{TestDir, read_gzip_text};
 
@@ -66,26 +66,31 @@ fn parallel_single_end_matches_serial_and_preserves_order_across_batches() {
     }
 
     let reads = test.write("reads.fastq", &fastq);
-    let serial_output = test.child("serial_output");
-    let parallel_output = test.child("parallel_output");
-
-    let serial_args = make_args(
-        reads.clone(),
-        barcodes.clone(),
-        samples.clone(),
-        serial_output.clone(),
-    );
-    let parallel_args = make_args(reads, barcodes, samples, parallel_output.clone());
-
-    simplex::demux::run(serial_args).expect("Serial demultiplexing should succeed");
-    simplex::demux::run_with_threads(parallel_args, 4)
-        .expect("Parallel demultiplexing should succeed");
+    let outputs: Vec<_> = [1usize, 2, 8]
+        .into_iter()
+        .map(|threads| {
+            let output = test.child(&format!("threads_{threads}"));
+            let args = make_args(
+                reads.clone(),
+                barcodes.clone(),
+                samples.clone(),
+                output.clone(),
+            );
+            plexless::demux::run_with_threads(args, threads)
+                .unwrap_or_else(|error| panic!("{threads}-thread demultiplexing failed: {error}"));
+            output
+        })
+        .collect();
 
     for sample in ["sample_1.fastq.gz", "sample_2.fastq.gz"] {
-        assert_eq!(
-            read_gzip_text(&serial_output.join(sample)),
-            read_gzip_text(&parallel_output.join(sample)),
-            "parallel output differs for {sample}"
-        );
+        let expected = read_gzip_text(&outputs[0].join(sample));
+        for (index, output) in outputs.iter().enumerate().skip(1) {
+            assert_eq!(
+                expected,
+                read_gzip_text(&output.join(sample)),
+                "{}-thread output differs for {sample}",
+                [1usize, 2, 8][index]
+            );
+        }
     }
 }

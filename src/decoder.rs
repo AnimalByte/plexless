@@ -5,8 +5,15 @@ use crate::encoder::{EncodedBarcode, encode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeResult {
-    Exact { barcode_id: u32 },
-    Corrected { barcode_id: u32, mismatches: u8 },
+    /// `barcode_id` is the decoder-local candidate index. Routing nodes use it
+    /// directly to index their contiguous target arrays.
+    Exact {
+        barcode_id: u32,
+    },
+    Corrected {
+        barcode_id: u32,
+        mismatches: u8,
+    },
     Ambiguous,
     Unmatched,
 }
@@ -36,26 +43,55 @@ struct NeighborBuilder<'a> {
 }
 
 impl Decoder {
+    /// Builds a decoder over an entire set. This remains useful for callers
+    /// that do not need route-local namespaces; hierarchical routing uses
+    /// `new_subset` instead.
     pub fn new(set: &BarcodeSet, max_mismatches: u8) -> Result<Self, String> {
-        if set.barcodes.is_empty() {
-            return Err(format!("Barcode set {} is empty", set.symbol as char));
-        }
+        let candidate_ids: Result<Vec<u32>, _> =
+            (0..set.barcodes.len()).map(u32::try_from).collect();
+        Self::new_subset(
+            set,
+            &candidate_ids.map_err(|_| "Too many barcodes")?,
+            max_mismatches,
+            "routing root",
+        )
+    }
 
+    pub(crate) fn new_subset(
+        set: &BarcodeSet,
+        candidate_ids: &[u32],
+        max_mismatches: u8,
+        parent_path: &str,
+    ) -> Result<Self, String> {
+        if candidate_ids.is_empty() {
+            return Err(format!(
+                "Barcode candidate set {} is empty under {parent_path}",
+                set.symbol as char
+            ));
+        }
         if max_mismatches > 2 {
             return Err("Maximum mismatches greater than 2 are not supported".into());
         }
 
-        let mut barcodes = Vec::with_capacity(set.barcodes.len());
-        let mut exact = HashMap::with_capacity(set.barcodes.len());
-
-        let first = encode(set.barcodes[0].sequence.as_bytes())?;
-        let length = first.length;
+        let mut barcodes = Vec::with_capacity(candidate_ids.len());
+        let mut names = Vec::with_capacity(candidate_ids.len());
+        let mut exact = HashMap::with_capacity(candidate_ids.len());
+        let first_barcode = set
+            .barcode(candidate_ids[0])
+            .ok_or("Internal error: invalid barcode candidate ID")?;
+        let length = encode(first_barcode.sequence.as_bytes())?.length;
 
         if max_mismatches > length {
-            return Err("Maximum mismatches cannot exceed barcode length".into());
+            return Err(format!(
+                "Maximum mismatches cannot exceed barcode length for set {} under {parent_path}",
+                set.symbol as char
+            ));
         }
 
-        for (index, barcode) in set.barcodes.iter().enumerate() {
+        for &global_id in candidate_ids {
+            let barcode = set
+                .barcode(global_id)
+                .ok_or("Internal error: invalid barcode candidate ID")?;
             let encoded = encode(barcode.sequence.as_bytes())?;
 
             if encoded.length != length {
@@ -64,26 +100,30 @@ impl Decoder {
                     set.symbol as char
                 ));
             }
-
             if encoded.n_mask != 0 {
                 return Err(format!("Whitelist barcode '{}' contains N", barcode.id));
             }
 
-            let barcode_id = u32::try_from(index).map_err(|_| "Too many barcodes")?;
-
-            if exact.insert(encoded.value, barcode_id).is_some() {
+            let local_id = u32::try_from(barcodes.len()).map_err(|_| "Too many barcodes")?;
+            if let Some(existing_id) = exact.insert(encoded.value, local_id) {
+                let existing_name = names
+                    .get(usize::try_from(existing_id).expect("local barcode ID fits usize"))
+                    .expect("exact index refers to an existing barcode name");
                 return Err(format!(
-                    "Duplicate barcode sequence '{}' in set {}",
-                    barcode.sequence, set.symbol as char
+                    "Duplicate barcode sequence in routing node under {parent_path}: \
+                     {} barcodes '{}' and '{}' have the same sequence",
+                    set.symbol as char, existing_name, barcode.id
                 ));
             }
 
+            names.push(barcode.id.as_str());
             barcodes.push(encoded);
         }
 
-        validate_barcode_distance(&barcodes, set, max_mismatches)?;
+        validate_barcode_distance(&barcodes, &names, set.symbol, max_mismatches, parent_path)?;
 
-        let corrected = build_correction_index(&barcodes, &exact, length, max_mismatches)?;
+        let corrected = build_correction_index(&barcodes, &exact, length, max_mismatches)
+            .map_err(|error| format!("{error} under {parent_path}"))?;
 
         Ok(Self {
             barcodes,
@@ -98,22 +138,18 @@ impl Decoder {
         if observed.length != self.length {
             return DecodeResult::Unmatched;
         }
-
         if observed.n_mask != 0 {
             return self.decode_with_n(observed);
         }
-
         if let Some(&barcode_id) = self.exact.get(&observed.value) {
             return DecodeResult::Exact { barcode_id };
         }
-
         if let Some(target) = self.corrected.get(&observed.value) {
             return DecodeResult::Corrected {
                 barcode_id: target.barcode_id,
                 mismatches: target.mismatches,
             };
         }
-
         DecodeResult::Unmatched
     }
 
@@ -126,30 +162,25 @@ impl Decoder {
         }
 
         let ignored_positions = expand_n_mask(observed.n_mask);
-
         let mut best_id = 0u32;
         let mut best_distance = u8::MAX;
         let mut tied = false;
 
+        // This scans only the candidates in this routing node. Barcodes in
+        // unrelated parent namespaces are never considered.
         for (index, expected) in self.barcodes.iter().enumerate() {
             let diff = observed.value ^ expected.value;
-
             let mismatch_bits = (diff | (diff >> 1)) & 0x5555_5555_5555_5555;
-
             let known_mismatches = u8::try_from((mismatch_bits & !ignored_positions).count_ones())
                 .expect("Barcode cannot contain more than 32 mismatches");
-
             let distance = known_mismatches + n_count;
 
             if distance > self.max_mismatches {
                 continue;
             }
-
             if distance < best_distance {
                 best_distance = distance;
-
                 best_id = u32::try_from(index).expect("Barcode index must fit in u32");
-
                 tied = false;
             } else if distance == best_distance {
                 tied = true;
@@ -175,12 +206,10 @@ impl NeighborBuilder<'_> {
             if self.exact.contains_key(&current) {
                 return Err("Unsafe barcode correction collision detected".into());
             }
-
             if let Some(existing) = self.corrected.get(&current) {
                 if existing.barcode_id != self.barcode_id {
                     return Err("Unsafe barcode correction collision detected".into());
                 }
-
                 return Ok(());
             }
 
@@ -191,36 +220,32 @@ impl NeighborBuilder<'_> {
                     mismatches: self.distance,
                 },
             );
-
             return Ok(());
         }
 
         for position in start_position..self.length {
             let shift = u32::from(position) * 2;
-
             let mask = 0b11u64 << shift;
-
             let original_base = (self.original >> shift) & 0b11;
 
             for replacement in 0u64..4 {
                 if replacement == original_base {
                     continue;
                 }
-
                 let mutated = (current & !mask) | (replacement << shift);
-
                 self.add(mutated, position + 1, remaining - 1)?;
             }
         }
-
         Ok(())
     }
 }
 
 fn validate_barcode_distance(
     barcodes: &[EncodedBarcode],
-    set: &BarcodeSet,
+    names: &[&str],
+    symbol: u8,
     max_mismatches: u8,
+    parent_path: &str,
 ) -> Result<(), String> {
     if max_mismatches == 0 {
         return Ok(());
@@ -234,23 +259,16 @@ fn validate_barcode_distance(
     for i in 0..barcodes.len() {
         for j in (i + 1)..barcodes.len() {
             let distance = hamming_distance(barcodes[i].value, barcodes[j].value);
-
             if distance < required_distance {
                 return Err(format!(
-                    "Barcodes '{}' and '{}' in set {} have Hamming \
-                     distance {}, but at least {} is required for \
-                     {}-mismatch correction",
-                    set.barcodes[i].id,
-                    set.barcodes[j].id,
-                    set.symbol as char,
-                    distance,
-                    required_distance,
-                    max_mismatches
+                    "Unsafe barcode correction collision under {parent_path}:\n\
+                     {} barcodes '{}' and '{}' require minimum Hamming distance {} \
+                     for max_mismatches={}, but observed distance is {}.",
+                    symbol as char, names[i], names[j], required_distance, max_mismatches, distance
                 ));
             }
         }
     }
-
     Ok(())
 }
 
@@ -261,14 +279,12 @@ fn build_correction_index(
     max_mismatches: u8,
 ) -> Result<HashMap<u64, CorrectionTarget>, String> {
     let mut corrected = HashMap::new();
-
     if max_mismatches == 0 {
         return Ok(corrected);
     }
 
     for (index, barcode) in barcodes.iter().enumerate() {
         let barcode_id = u32::try_from(index).map_err(|_| "Too many barcodes")?;
-
         for distance in 1..=max_mismatches {
             let mut builder = NeighborBuilder {
                 original: barcode.value,
@@ -278,19 +294,15 @@ fn build_correction_index(
                 exact,
                 corrected: &mut corrected,
             };
-
             builder.add(barcode.value, 0, distance)?;
         }
     }
-
     Ok(corrected)
 }
 
 fn hamming_distance(a: u64, b: u64) -> u8 {
     let diff = a ^ b;
-
     let mismatch_bits = (diff | (diff >> 1)) & 0x5555_5555_5555_5555;
-
     u8::try_from(mismatch_bits.count_ones())
         .expect("Barcode cannot contain more than 32 mismatches")
 }
@@ -304,10 +316,53 @@ fn expand_n_mask(mask: u32) -> u64 {
         if input & 1 != 0 {
             output |= 1u64 << (position * 2);
         }
-
         input >>= 1;
         position += 1;
     }
-
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Production constructors reject this deliberately unsafe two-barcode
+    /// geometry. Building it directly here exercises the conservative runtime
+    /// ambiguity branch as a defense-in-depth behavior.
+    fn unsafe_n_test_decoder() -> Decoder {
+        let barcodes = vec![encode(b"AAAA").unwrap(), encode(b"AAAT").unwrap()];
+        let exact = HashMap::from([(barcodes[0].value, 0), (barcodes[1].value, 1)]);
+        Decoder {
+            barcodes,
+            exact,
+            corrected: HashMap::new(),
+            length: 4,
+            max_mismatches: 1,
+        }
+    }
+
+    #[test]
+    fn n_aware_decode_covers_exact_corrected_ambiguous_and_unmatched() {
+        let decoder = unsafe_n_test_decoder();
+
+        assert_eq!(
+            decoder.decode(encode(b"AAAA").unwrap()),
+            DecodeResult::Exact { barcode_id: 0 }
+        );
+        assert_eq!(
+            decoder.decode(encode(b"ANAA").unwrap()),
+            DecodeResult::Corrected {
+                barcode_id: 0,
+                mismatches: 1
+            }
+        );
+        assert_eq!(
+            decoder.decode(encode(b"AAAN").unwrap()),
+            DecodeResult::Ambiguous
+        );
+        assert_eq!(
+            decoder.decode(encode(b"AANN").unwrap()),
+            DecodeResult::Unmatched
+        );
+    }
 }

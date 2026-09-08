@@ -5,19 +5,15 @@ use std::path::Path;
 
 use crate::barcodes::BarcodeCatalog;
 use crate::cli::DemuxArgs;
-use crate::decoder::{DecodeResult, Decoder};
-use crate::encoder::encode;
 use crate::fastq::InputReader;
 use crate::input::{InputFiles, resolve_inputs};
-use crate::routing::{RouteResult, RoutingTable};
+use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
 use crate::stats::FastqStats;
-use crate::structure::{ReadLayout, ReadStructure};
+use crate::structure::ReadLayout;
 use crate::writer::{OutputMate, WriterManager};
 
 const MAX_OPEN_WRITERS: usize = 64;
-const MAX_BARCODE_SETS: usize = 3;
-const MAX_BARCODE_LENGTH: usize = 32;
 const PAIRED_RESYNC_WINDOW: usize = 1024;
 
 #[derive(Debug, Default)]
@@ -75,11 +71,7 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
 
     let samples = SampleSheet::load(&args.samples, &layout, &catalog)?;
 
-    let barcode_symbols = layout.barcode_symbols();
-
-    let decoders = build_decoders(&barcode_symbols, &catalog, args.max_mismatches)?;
-
-    let routing = RoutingTable::new(&samples)?;
+    let routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
 
     let output_dir = args.output.clone();
 
@@ -107,22 +99,12 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
     let mut counts = DemuxCounts::default();
 
     match &inputs {
-        InputFiles::Single(reads) => run_single(
-            reads,
-            &layout,
-            &barcode_symbols,
-            &decoders,
-            &routing,
-            &mut writer,
-            r1_stats.as_mut(),
-            &mut counts,
-        )?,
+        InputFiles::Single(reads) => {
+            run_single(reads, &routing, &mut writer, r1_stats.as_mut(), &mut counts)?
+        }
         InputFiles::Paired { r1, r2 } => run_paired(
             r1,
             r2,
-            &layout,
-            &barcode_symbols,
-            &decoders,
             &routing,
             &mut writer,
             r1_stats.as_mut(),
@@ -142,46 +124,17 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
     Ok(())
 }
 
-fn build_decoders(
-    barcode_symbols: &[u8],
-    catalog: &BarcodeCatalog,
-    max_mismatches: u8,
-) -> Result<HashMap<u8, Decoder>, String> {
-    let mut decoders = HashMap::new();
-
-    for &symbol in barcode_symbols {
-        let set = catalog
-            .set(symbol)
-            .ok_or_else(|| format!("Missing barcode set {}", symbol as char))?;
-
-        let decoder = Decoder::new(set, max_mismatches)?;
-
-        decoders.insert(symbol, decoder);
-    }
-
-    Ok(decoders)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_single(
     path: &Path,
-    layout: &ReadLayout,
-    barcode_symbols: &[u8],
-    decoders: &HashMap<u8, Decoder>,
-    routing: &RoutingTable,
+    routing: &RoutingTree,
     writer: &mut WriterManager,
     mut stats: Option<&mut FastqStats>,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
     let mut reader = InputReader::open(path);
 
-    let prefix_len = match layout {
-        ReadLayout::Single { r1 } => r1.as_ref().map_or(0, |structure| structure.prefix_len),
-
-        ReadLayout::Paired { .. } => {
-            return Err("Internal error: expected single-end layout".into());
-        }
-    };
+    let prefix_len = routing.r1_prefix_len();
 
     while let Some(record) = reader.next_record() {
         let record =
@@ -201,10 +154,8 @@ fn run_single(
             stats.update(seq, qual)?;
         }
 
-        let route = if let Some((calls, count)) =
-            decode_read(layout, barcode_symbols, seq, None, decoders)?
-        {
-            routing.route(&calls[..count])
+        let route = if let Some(route) = routing.route_read(seq, None)? {
+            route
         } else {
             counts.short_reads += 1;
             RouteResult::Unmatched
@@ -408,19 +359,14 @@ fn process_pair_parts(
     r2_id: &[u8],
     r2_seq: &[u8],
     r2_qual: &[u8],
-    layout: &ReadLayout,
-    barcode_symbols: &[u8],
-    decoders: &HashMap<u8, Decoder>,
-    routing: &RoutingTable,
+    routing: &RoutingTree,
     writer: &mut WriterManager,
     r1_prefix: usize,
     r2_prefix: usize,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let route = if let Some((calls, count)) =
-        decode_read(layout, barcode_symbols, r1_seq, Some(r2_seq), decoders)?
-    {
-        routing.route(&calls[..count])
+    let route = if let Some(route) = routing.route_read(r1_seq, Some(r2_seq))? {
+        route
     } else {
         counts.short_reads += 1;
         RouteResult::Unmatched
@@ -477,10 +423,7 @@ fn recover_pairing(
     r2_reader: &mut InputReader,
     r1_path: &Path,
     r2_path: &Path,
-    layout: &ReadLayout,
-    barcode_symbols: &[u8],
-    decoders: &HashMap<u8, Decoder>,
-    routing: &RoutingTable,
+    routing: &RoutingTree,
     writer: &mut WriterManager,
     r1_prefix: usize,
     r2_prefix: usize,
@@ -513,9 +456,6 @@ fn recover_pairing(
                 &r2_record.id,
                 &r2_record.seq,
                 &r2_record.qual,
-                layout,
-                barcode_symbols,
-                decoders,
                 routing,
                 writer,
                 r1_prefix,
@@ -626,10 +566,7 @@ fn recover_pairing(
 fn run_paired(
     r1_path: &Path,
     r2_path: &Path,
-    layout: &ReadLayout,
-    barcode_symbols: &[u8],
-    decoders: &HashMap<u8, Decoder>,
-    routing: &RoutingTable,
+    routing: &RoutingTree,
     writer: &mut WriterManager,
     mut r1_stats: Option<&mut FastqStats>,
     mut r2_stats: Option<&mut FastqStats>,
@@ -638,16 +575,7 @@ fn run_paired(
     let mut r1_reader = InputReader::open(r1_path);
     let mut r2_reader = InputReader::open(r2_path);
 
-    let (r1_prefix, r2_prefix) = match layout {
-        ReadLayout::Paired { r1, r2 } => (
-            r1.as_ref().map_or(0, |structure| structure.prefix_len),
-            r2.as_ref().map_or(0, |structure| structure.prefix_len),
-        ),
-
-        ReadLayout::Single { .. } => {
-            return Err("Internal error: expected paired-end layout".into());
-        }
-    };
+    let (r1_prefix, r2_prefix) = (routing.r1_prefix_len(), routing.r2_prefix_len());
 
     loop {
         let r1_next = r1_reader.next_record();
@@ -692,9 +620,6 @@ fn run_paired(
                         r2_record.id(),
                         r2_seq,
                         r2_qual,
-                        layout,
-                        barcode_symbols,
-                        decoders,
                         routing,
                         writer,
                         r1_prefix,
@@ -715,9 +640,6 @@ fn run_paired(
                     &mut r2_reader,
                     r1_path,
                     r2_path,
-                    layout,
-                    barcode_symbols,
-                    decoders,
                     routing,
                     writer,
                     r1_prefix,
@@ -789,149 +711,6 @@ fn run_paired(
     }
 
     Ok(())
-}
-
-pub(crate) fn decode_read(
-    layout: &ReadLayout,
-    symbols: &[u8],
-    r1_seq: &[u8],
-    r2_seq: Option<&[u8]>,
-    decoders: &HashMap<u8, Decoder>,
-) -> Result<Option<([DecodeResult; MAX_BARCODE_SETS], usize)>, String> {
-    match layout {
-        ReadLayout::Single { r1 } => {
-            if let Some(structure) = r1
-                && r1_seq.len() < structure.prefix_len
-            {
-                return Ok(None);
-            }
-        }
-
-        ReadLayout::Paired { r1, r2 } => {
-            if let Some(structure) = r1
-                && r1_seq.len() < structure.prefix_len
-            {
-                return Ok(None);
-            }
-
-            if let Some(structure) = r2 {
-                let r2_seq = r2_seq.ok_or("Missing R2 sequence")?;
-
-                if r2_seq.len() < structure.prefix_len {
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
-    if symbols.len() > MAX_BARCODE_SETS {
-        return Err("Too many barcode sets".into());
-    }
-
-    let mut calls = [DecodeResult::Unmatched; MAX_BARCODE_SETS];
-
-    for (index, symbol) in symbols.iter().copied().enumerate() {
-        let mut buffer = [0u8; MAX_BARCODE_LENGTH];
-
-        let Some(length) = assemble_barcode(layout, symbol, r1_seq, r2_seq, &mut buffer)? else {
-            return Ok(None);
-        };
-
-        let Ok(observed) = encode(&buffer[..length]) else {
-            calls[index] = DecodeResult::Unmatched;
-            continue;
-        };
-
-        let decoder = decoders
-            .get(&symbol)
-            .ok_or_else(|| format!("Missing decoder for barcode set {}", symbol as char))?;
-
-        calls[index] = decoder.decode(observed);
-    }
-
-    Ok(Some((calls, symbols.len())))
-}
-
-fn assemble_barcode(
-    layout: &ReadLayout,
-    symbol: u8,
-    r1_seq: &[u8],
-    r2_seq: Option<&[u8]>,
-    buffer: &mut [u8; MAX_BARCODE_LENGTH],
-) -> Result<Option<usize>, String> {
-    let mut length = 0usize;
-
-    match layout {
-        ReadLayout::Single { r1 } => {
-            if let Some(structure) = r1
-                && !append_segments(structure, symbol, r1_seq, buffer, &mut length)?
-            {
-                return Ok(None);
-            }
-        }
-
-        ReadLayout::Paired { r1, r2 } => {
-            if let Some(structure) = r1
-                && !append_segments(structure, symbol, r1_seq, buffer, &mut length)?
-            {
-                return Ok(None);
-            }
-
-            if let Some(structure) = r2 {
-                let r2_seq = r2_seq.ok_or("Missing R2 sequence")?;
-
-                if !append_segments(structure, symbol, r2_seq, buffer, &mut length)? {
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
-    if length == 0 {
-        return Err(format!(
-            "Barcode set {} has no sequence segments",
-            symbol as char
-        ));
-    }
-
-    Ok(Some(length))
-}
-
-fn append_segments(
-    structure: &ReadStructure,
-    symbol: u8,
-    seq: &[u8],
-    buffer: &mut [u8; MAX_BARCODE_LENGTH],
-    length: &mut usize,
-) -> Result<bool, String> {
-    for segment in &structure.segments {
-        if segment.symbol != symbol {
-            continue;
-        }
-
-        if segment.end > seq.len() {
-            return Ok(false);
-        }
-
-        let segment_seq = &seq[segment.start..segment.end];
-
-        let new_length = length
-            .checked_add(segment_seq.len())
-            .ok_or("Barcode length overflow")?;
-
-        if new_length > MAX_BARCODE_LENGTH {
-            return Err(format!(
-                "Logical barcode {} exceeds {} bases",
-                symbol as char, MAX_BARCODE_LENGTH
-            ));
-        }
-
-        buffer[*length..new_length].copy_from_slice(segment_seq);
-
-        *length = new_length;
-    }
-
-    Ok(true)
 }
 
 pub(crate) fn core_read_id(id: &[u8]) -> &[u8] {

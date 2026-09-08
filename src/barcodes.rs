@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::encoder::encode;
-use crate::structure::{ReadLayout, ReadStructure};
+use crate::structure::{ReadLayout, is_barcode_symbol};
 
 #[derive(Debug)]
 pub struct Barcode {
@@ -27,6 +27,7 @@ pub struct BarcodeCatalog {
 impl BarcodeCatalog {
     pub fn load(path: &Path, layout: &ReadLayout) -> Result<Self, String> {
         let expected_lengths = barcode_lengths(layout)?;
+        let root_symbol = layout.barcode_symbols().first().copied();
 
         let file = File::open(path).map_err(|e| format!("Could not open barcode file: {e}"))?;
 
@@ -80,9 +81,9 @@ impl BarcodeCatalog {
 
             let symbol = set_text.as_bytes()[0];
 
-            if !matches!(symbol, b'A' | b'B' | b'C') {
+            if !is_barcode_symbol(symbol) {
                 return Err(format!(
-                    "Invalid barcode set '{}'; expected A, B, or C",
+                    "Invalid barcode set '{}'; expected an uppercase A-Z symbol other than T",
                     symbol as char
                 ));
             }
@@ -144,13 +145,18 @@ impl BarcodeCatalog {
                 ));
             }
 
-            let sequences = seen_sequences.entry(symbol).or_default();
-
-            if !sequences.insert(sequence.clone()) {
-                return Err(format!(
-                    "Duplicate barcode sequence '{}' in set {}",
-                    sequence, symbol as char
-                ));
+            // The root has no namespace in which duplicate sequences could be
+            // distinguished. At child levels, duplicate physical sequences
+            // are allowed globally and are validated only when they occur as
+            // siblings in the same compiled routing node.
+            if Some(symbol) == root_symbol {
+                let sequences = seen_sequences.entry(symbol).or_default();
+                if !sequences.insert(sequence.clone()) {
+                    return Err(format!(
+                        "Duplicate barcode sequence '{}' in root set {}",
+                        sequence, symbol as char
+                    ));
+                }
             }
 
             let internal_id = u32::try_from(set.barcodes.len())
@@ -187,49 +193,16 @@ impl BarcodeCatalog {
 }
 
 fn barcode_lengths(layout: &ReadLayout) -> Result<HashMap<u8, usize>, String> {
-    let mut lengths = HashMap::new();
-
-    match layout {
-        ReadLayout::Single { r1 } => {
-            if let Some(r1) = r1 {
-                add_lengths(r1, &mut lengths)?;
-            }
-        }
-
-        ReadLayout::Paired { r1, r2 } => {
-            if let Some(r1) = r1 {
-                add_lengths(r1, &mut lengths)?;
-            }
-
-            if let Some(r2) = r2 {
-                add_lengths(r2, &mut lengths)?;
-            }
-        }
-    }
-
-    Ok(lengths)
+    Ok(layout
+        .compile_extraction_plans()?
+        .plans()
+        .iter()
+        .map(|plan| (plan.symbol, plan.logical_length))
+        .collect())
 }
 
-fn add_lengths(structure: &ReadStructure, lengths: &mut HashMap<u8, usize>) -> Result<(), String> {
-    for segment in &structure.segments {
-        if segment.symbol == b'T' {
-            continue;
-        }
-
-        let length = segment.end - segment.start;
-
-        let total = lengths.entry(segment.symbol).or_insert(0);
-
-        *total = total.checked_add(length).ok_or("Barcode length overflow")?;
-
-        if *total > 32 {
-            return Err(format!(
-                "Logical barcode {} is {} bases long; \
-                 maximum supported length is 32",
-                segment.symbol as char, *total
-            ));
-        }
+impl BarcodeSet {
+    pub fn barcode(&self, barcode_id: u32) -> Option<&Barcode> {
+        self.barcodes.get(usize::try_from(barcode_id).ok()?)
     }
-
-    Ok(())
 }

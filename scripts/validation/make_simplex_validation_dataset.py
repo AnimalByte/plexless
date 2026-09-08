@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Create a deterministic simplex validation dataset from paired FASTQ input.
+Create a deterministic plexless validation dataset from paired FASTQ input.
 
 Typical input is InSilicoSeq output:
     raw_R1.fastq.gz
@@ -12,7 +12,7 @@ Generated categories:
     unrouted    15%
     ambiguous    0%
 
-Ambiguous is intentionally 0 because simplex rejects correction-unsafe
+Ambiguous is intentionally 0 because plexless rejects correction-unsafe
 whitelist geometry before demultiplexing.
 
 Single-end structure:
@@ -209,7 +209,7 @@ def write_metadata(
             f.write(f"{sample}\t{sample_counts[sample]}\n")
 
     with (outdir / "metadata.txt").open("w", encoding="ascii") as f:
-        f.write("simplex deterministic validation fixture\n")
+        f.write("plexless deterministic validation fixture\n")
         f.write(f"records_or_pairs\t{total}\n")
         f.write(f"single_end_structure\t{SE_STRUCTURE}\n")
         f.write(f"paired_r1_structure\t{PE_R1_STRUCTURE}\n")
@@ -219,7 +219,7 @@ def write_metadata(
         f.write("ambiguous_expected\t0\n")
         f.write(
             "ambiguous_note\tRuntime ambiguity is intentionally unreachable "
-            "for a valid correction-safe whitelist under current simplex rules.\n"
+            "for a valid correction-safe whitelist under current plexless rules.\n"
         )
 
 
@@ -370,7 +370,7 @@ def main() -> None:
 
     print()
     print(f"Done: {processed:,} source pairs")
-    print("Expected simplex summary:")
+    print("Expected plexless summary:")
     for category in ("assigned", "unmatched", "ambiguous", "unrouted"):
         print(f"  {category:10s} {category_counts[category]:,}")
     print(f"  {'total':10s} {processed:,}")

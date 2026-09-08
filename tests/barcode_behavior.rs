@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use simplex::cli::DemuxArgs;
+use plexless::cli::DemuxArgs;
 
 use common::{TestDir, read_gzip_text};
 
@@ -43,7 +43,7 @@ fn run_single(
 
     args.validate().expect("CLI arguments should be valid");
 
-    simplex::demux::run(args).expect("Demultiplexing should succeed");
+    plexless::demux::run(args).expect("Demultiplexing should succeed");
 
     output
 }

@@ -14,10 +14,10 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "simplex")]
+#[command(name = "plexless")]
 #[command(about = "FASTQ nested demultiplexing tool")]
 pub struct Cli {
-    /// Total CPU-work budget. simplex accounts for FASTQ parsing and
+    /// Total CPU-work budget. plexless accounts for FASTQ parsing and
     /// dynamically shares remaining capacity between gzip decompression and
     /// demultiplexing/output compression. A value of 1 preserves the serial
     /// reference pipeline.

@@ -1,6 +1,6 @@
-# simplex
+# plexless
 
-`simplex` is a streaming FASTQ demultiplexer written in Rust.
+`plexless` is a streaming FASTQ demultiplexer written in Rust.
 
 It is designed for barcode layouts that are described directly from the read structure, including single-end and paired-end data where a logical barcode may be split across R1 and R2.
 
@@ -9,9 +9,11 @@ It is designed for barcode layouts that are described directly from the read str
 - Single-end and paired-end FASTQ demultiplexing
 - FASTQ and gzip-compressed FASTQ input
 - User-defined read structures
-- Logical barcode sets `A`, `B`, and `C`
+- Hierarchical barcode routing compiled from a tabular sample sheet
+- Generic logical barcode symbols `A-Z` except reserved technical symbol `T`
 - Technical sequence segments with `T`
 - Barcode concatenation across repeated segments and across mates
+- Per-segment forward or reverse-complement orientation
 - Exact barcode matching
 - Configurable mismatch correction
 - Explicit handling of `N` bases
@@ -26,14 +28,14 @@ It is designed for barcode layouts that are described directly from the read str
 ## Prebuilt binary
 
 Prebuilt Linux x86-64 binaries are available from the
-[GitHub releases page](https://github.com/AnimalByte/simplex/releases). The
+[GitHub releases page](https://github.com/AnimalByte/plexless/releases). The
 release binary includes zlib, so zlib does not need to be installed separately.
 
 ## Build from source
 
 ### System dependencies
 
-`simplex` uses the system zlib implementation through `flate2` for output gzip compression and for the single-thread reference input path. Parallel gzip input uses `rapidgzip-core`, which validates gzip framing/checksums while decoding ordinary gzip streams in parallel.
+`plexless` uses the system zlib implementation through `flate2` for output gzip compression and for the single-thread reference input path. Parallel gzip input uses `rapidgzip-core`, which validates gzip framing/checksums while decoding ordinary gzip streams in parallel.
 
 ### Ubuntu / Debian
 
@@ -65,8 +67,11 @@ cargo build --release
 The executable will be:
 
 ```text
-target/release/simplex
+target/release/plexless
 ```
+
+For migration compatibility, the build also produces
+`target/release/simplex` with the same command-line interface.
 
 For development:
 
@@ -101,9 +106,7 @@ The structured prefix is removed from assigned reads before output.
 
 | Symbol | Meaning |
 | --- | --- |
-| `A` | Identifying barcode set A |
-| `B` | Identifying barcode set B |
-| `C` | Identifying barcode set C |
+| `A-S`, `U-Z` | Generic logical barcode/routing levels |
 | `T` | Technical sequence; trimmed but not used for sample identity |
 
 `T` does not appear in the barcode whitelist or sample sheet.
@@ -134,9 +137,19 @@ then the logical A barcode is:
 ACGT
 ```
 
-The same rule applies to B and C.
+The same rule applies to every logical barcode symbol.
 
-Sequences are interpreted exactly as they appear in the FASTQ. `simplex` does not automatically reverse-complement R2 barcode segments.
+By default, pieces are interpreted in forward orientation. Append `(rc)` to
+reverse-complement only that barcode piece before concatenation:
+
+```text
+R1_4A4B
+R2_4A(rc)4B(rc)
+```
+
+Orientation is per segment and can be mixed between symbols and mates. Quality
+strings are not transformed because barcode decoding does not use qualities.
+Whitelist sequences are always written in canonical orientation.
 
 ## Barcode whitelist
 
@@ -165,35 +178,53 @@ Whitelist barcode sequences:
 - must contain valid DNA bases
 - cannot contain `N`
 - must have unique IDs within their set
-- must have unique sequences within their set
+
+The root barcode set must have unique sequences. A child sequence may be
+reused under independent parent paths, including under different IDs. Reused
+sequences are rejected only if they become siblings in the same routing node.
 
 Logical barcodes are currently limited to 32 bases.
 
 ## Sample sheet
 
-The sample sheet maps valid barcode IDs to samples.
+The sample sheet maps complete hierarchical barcode paths to samples.
 
 Example:
 
 ```tsv
 Sample	A	B
 sample_1	A01	B01
-sample_2	A02	B02
+sample_2	A01	B02
+sample_3	A02	B01
+sample_4	A02	B02
 ```
 
 Only barcode sets present in the read structure belong in the sample sheet.
 
-The barcode whitelist and sample sheet are deliberately separate:
+Columns follow deterministic symbol order (`A`, then `B`, then `C`, and so
+on, skipping `T`). Every row must specify every level. At startup, the table is
+compiled into a routing tree:
+
+```text
+decode A at the root
+  -> choose the A parent
+  -> decode B only against children beneath that A
+  -> continue until the path reaches a sample
+```
+
+The barcode whitelist and sample sheet remain deliberately separate:
 
 - the barcode whitelist defines the complete valid barcode space
-- the sample sheet defines which barcode combinations are routed to samples
+- the sample sheet defines parent-local child namespaces and sample routes
 
-This allows valid barcode combinations to exist without being assigned to a sample.
+An unused root barcode remains `unrouted`. At child levels, a barcode not
+reachable from the resolved parent is `unmatched`; unrelated namespaces are
+never scanned to reinterpret it.
 
 ## Single-end example
 
 ```bash
-simplex demux \
+plexless demux \
     --reads reads.fastq.gz \
     --structure R1_10A11B4T \
     --barcodes barcodes.tsv \
@@ -204,7 +235,7 @@ simplex demux \
 Equivalent with the short output option:
 
 ```bash
-simplex demux \
+plexless demux \
     --reads reads.fastq.gz \
     --structure R1_10A11B4T \
     --barcodes barcodes.tsv \
@@ -215,7 +246,7 @@ simplex demux \
 ## Paired-end example
 
 ```bash
-simplex demux \
+plexless demux \
     --r1 reads_R1.fastq.gz \
     --r2 reads_R2.fastq.gz \
     --r1-structure R1_2A2B2T \
@@ -245,11 +276,17 @@ Supported correction distances are currently 0, 1, and 2 mismatches.
 
 ### Unique correction
 
-`simplex` validates the whitelist before processing reads.
+`plexless` validates each effective routing-node candidate set before
+processing reads.
 
-For a mismatch tolerance of `e`, whitelist barcodes must be separated sufficiently to make correction unique. For example, one-mismatch correction requires a minimum pairwise Hamming distance of 3.
+For a mismatch tolerance of `e`, sibling barcodes must be separated
+sufficiently to make correction unique. For example, one-mismatch correction
+requires sibling distance of at least 3. Barcodes beneath different parents do
+not need to be mutually distinguishable because they are never decoded
+together.
 
-An unsafe whitelist is rejected before demultiplexing begins.
+An unsafe node is rejected before demultiplexing begins, with its parent path
+and conflicting barcode IDs in the error.
 
 ### `N` bases
 
@@ -271,11 +308,13 @@ A read or pair can end in one of four routing states.
 
 ### Assigned
 
-All required barcode sets decode and the resulting combination exists in the sample sheet.
+Every routing level resolves within its current parent namespace and the leaf
+maps to a sample.
 
 ### Unmatched
 
-At least one barcode cannot be decoded within the configured mismatch limit.
+At least one barcode cannot be decoded within the configured mismatch limit
+against the candidates reachable from its resolved parent.
 
 ### Ambiguous
 
@@ -283,7 +322,8 @@ Barcode evidence does not support a unique correction.
 
 ### Unrouted
 
-All barcodes decode successfully, but the barcode combination does not exist in the sample sheet.
+A valid root barcode has no compiled sample route. Deeper barcodes outside a
+parent's candidate namespace are unmatched rather than globally decoded.
 
 ## Unassigned reads
 
@@ -308,7 +348,7 @@ R1: read1  read2  read3
 R2: read1         read3
 ```
 
-`read2` is treated as an R1 orphan. `simplex` searches forward for the next shared read ID, resynchronizes at `read3`, and continues processing.
+`read2` is treated as an R1 orphan. `plexless` searches forward for the next shared read ID, resynchronizes at `read3`, and continues processing.
 
 Orphan records:
 
@@ -317,7 +357,7 @@ Orphan records:
 - are written raw when `--write-unassigned` is enabled
 - do not cause immediate failure merely because one mate is missing
 
-Resynchronization uses a bounded lookahead window of 1024 records per mate. If synchronization cannot be recovered within that bound, `simplex` returns an error instead of guessing.
+Resynchronization uses a bounded lookahead window of 1024 records per mate. If synchronization cannot be recovered within that bound, `plexless` returns an error instead of guessing.
 
 Trailing records present in only one mate file are also treated as orphans.
 
@@ -349,7 +389,7 @@ Unassigned and orphan reads remain untrimmed.
 
 ## Compression
 
-`simplex` uses `flate2` with the system `zlib` backend for output gzip compression. With `--threads 1`, gzip input also follows the original Needletail/system-zlib reference path. With a larger CPU budget, ordinary seekable gzip input is decoded in parallel internally and then passed to Needletail as one ordered byte stream.
+`plexless` uses `flate2` with the system `zlib` backend for output gzip compression. With `--threads 1`, gzip input also follows the original Needletail/system-zlib reference path. With a larger CPU budget, ordinary seekable gzip input is decoded in parallel internally and then passed to Needletail as one ordered byte stream.
 
 The gzip compression level is configurable:
 
@@ -359,7 +399,7 @@ The gzip compression level is configurable:
 
 The default is level 2.
 
-`simplex` maintains a bounded cache of open output writers so large sample sheets do not require every output file to remain open simultaneously.
+`plexless` maintains a bounded cache of open output writers so large sample sheets do not require every output file to remain open simultaneously.
 
 The current maximum number of open writers is 64.
 
@@ -392,19 +432,20 @@ For paired data, R1 and R2 are reported separately.
 
 ## Validation and safety checks
 
-Before or during processing, `simplex` validates conditions including:
+Before or during processing, `plexless` validates conditions including:
 
 - malformed read structures
+- malformed `(rc)` orientation modifiers
 - invalid barcode symbols
 - missing barcode sets
 - duplicate barcode IDs
-- duplicate barcode sequences
+- duplicate root or node-local sibling sequences
 - barcode length mismatch
 - duplicate sample names
 - duplicate sample barcode combinations
 - unknown barcode IDs in the sample sheet
 - logical barcodes longer than 32 bases
-- unsafe mismatch-correction geometry
+- unsafe node-local mismatch-correction geometry with parent-path context
 - FASTQ parse failures
 - missing quality scores
 - reads shorter than the declared structured prefix
@@ -428,6 +469,13 @@ The integration suite covers:
 - single-end A+B+T demultiplexing
 - paired-end A+B+T demultiplexing
 - barcode assembly across mates
+- repeated-symbol assembly in R1-then-R2 order
+- segment-local reverse-complement normalization
+- asymmetric paired layouts
+- hierarchical exact routing through two and three levels
+- child sequence reuse across independent parent namespaces
+- parent-local correction safety and true sibling collision rejection
+- generic hierarchies deeper than three levels
 - technical-sequence trimming
 - one-mismatch correction
 - `N` handling
@@ -443,26 +491,28 @@ The integration suite covers:
 ## Current implementation limits
 
 - Maximum logical barcode length: 32 bases
-- Maximum barcode sets: 3 (`A`, `B`, `C`)
+- Barcode symbols: uppercase `A-Z`, with `T` reserved for technical sequence
 - Paired resynchronization lookahead: 1024 records
 - Output writer cache: 64 open writers
 - Mismatch correction: 0, 1, or 2 mismatches
 
 ## Development status
 
-`simplex` is currently under active development.
+`plexless` is currently under active development. Conservative traversal stops
+on an ambiguous decision at the current node; cross-level candidate-path
+rescue/scoring is intentionally not implemented yet.
 
 The parallel pipeline uses bounded queues, ordered batch emission, parallel output gzip compression, paired-read resynchronization, and automatic parallel gzip input. Performance work remains performance-tested so that correctness, deterministic routing, bounded memory use, and output integrity remain the primary constraints.
 
 ## Automatic parallel gzip input
 
 Pass one FASTQ file for single-end data or one R1/R2 pair for paired-end data.
-`simplex` handles parallel input processing internally.
+`plexless` handles parallel input processing internally.
 
 For example:
 
 ```bash
-simplex --threads 16 demux \
+plexless --threads 16 demux \
   --reads reads.fastq.gz \
   --structure R1_10A11B4T \
   --barcodes barcodes.tsv \
@@ -470,7 +520,7 @@ simplex --threads 16 demux \
   --output out
 ```
 
-For a normal seekable `.fastq.gz`, `simplex` internally parallelizes gzip
+For a normal seekable `.fastq.gz`, `plexless` internally parallelizes gzip
 decompression and presents Needletail with one ordered decompressed stream. It
 does not write temporary decompressed FASTQ files.
 
@@ -484,7 +534,7 @@ handling.
 
 `--threads` is a total CPU-work budget rather than a raw demultiplexing-worker
 count. Any positive integer is accepted; the value does not need to be a power
-of two. `simplex` accounts for one FASTQ parser for single-end input and two
+of two. `plexless` accounts for one FASTQ parser for single-end input and two
 FASTQ parsers for paired-end input. It shares the remaining budget between
 input decompression and demultiplexing/output compression.
 

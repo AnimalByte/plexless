@@ -1,6 +1,6 @@
 mod common;
 
-use simplex::cli::DemuxArgs;
+use plexless::cli::DemuxArgs;
 
 use common::{TestDir, read_gzip_text};
 
@@ -57,7 +57,7 @@ fn paired_end_demux_combines_a_and_b_across_mates_and_trims_t_from_each_mate() {
 
     args.validate().expect("CLI arguments should be valid");
 
-    simplex::demux::run(args).expect("Demultiplexing should succeed");
+    plexless::demux::run(args).expect("Demultiplexing should succeed");
 
     let observed_r1 = read_gzip_text(&output.join("sample_1_R1.fastq.gz"));
 

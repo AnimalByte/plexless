@@ -1,5 +1,6 @@
-use clap::Parser;
+//! Backward-compatible executable name for workflows migrating from simplex.
 
+use clap::Parser;
 use plexless::cli::{Cli, Command};
 
 fn main() {

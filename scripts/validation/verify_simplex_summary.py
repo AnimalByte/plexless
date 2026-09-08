@@ -33,7 +33,7 @@ def parse_summary(path: Path) -> dict[str, int]:
             flags=re.MULTILINE,
         )
         if not match:
-            raise SystemExit(f"Could not find '{key}' in simplex summary: {path}")
+            raise SystemExit(f"Could not find '{key}' in plexless summary: {path}")
         observed[key] = int(match.group(1))
 
     return observed

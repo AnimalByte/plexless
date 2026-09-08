@@ -19,7 +19,7 @@ impl TestDir {
             .as_nanos();
 
         let path = std::env::temp_dir().join(format!(
-            "simplex-test-{name}-{}-{nanos}",
+            "plexless-test-{name}-{}-{nanos}",
             std::process::id()
         ));
 

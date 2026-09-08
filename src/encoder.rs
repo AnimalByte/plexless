@@ -1,3 +1,5 @@
+pub const MAX_BARCODE_LENGTH: usize = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EncodedBarcode {
     pub value: u64,
@@ -10,8 +12,8 @@ pub fn encode(seq: &[u8]) -> Result<EncodedBarcode, String> {
         return Err("Barcode cannot be empty".into());
     }
 
-    if seq.len() > 32 {
-        return Err("Barcode cannot exceed 32 bases".into());
+    if seq.len() > MAX_BARCODE_LENGTH {
+        return Err(format!("Barcode cannot exceed {MAX_BARCODE_LENGTH} bases"));
     }
 
     let length = u8::try_from(seq.len()).map_err(|_| "Barcode length exceeds u8 capacity")?;

@@ -1,9 +1,9 @@
 mod common;
 
-use simplex::barcodes::BarcodeCatalog;
-use simplex::decoder::Decoder;
-use simplex::samples::SampleSheet;
-use simplex::structure::ReadLayout;
+use plexless::barcodes::BarcodeCatalog;
+use plexless::decoder::Decoder;
+use plexless::samples::SampleSheet;
+use plexless::structure::ReadLayout;
 
 use common::TestDir;
 
@@ -150,7 +150,7 @@ fn unknown_sample_barcode_id_is_rejected() {
 #[test]
 fn invalid_structure_symbol_is_rejected() {
     assert_error(
-        ReadLayout::single(Some("R1_4A4X2T")),
+        ReadLayout::single(Some("R1_4A4x2T")),
         "invalid read-structure symbol",
     );
 }

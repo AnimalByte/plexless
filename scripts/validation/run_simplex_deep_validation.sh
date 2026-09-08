@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SIMPLEX_BIN="${SIMPLEX_BIN:-./target/release/simplex}"
+SIMPLEX_BIN="${PLEXLESS_BIN:-${SIMPLEX_BIN:-./target/release/plexless}}"
 DATASET="${DATASET:-$HOME/simplex_validation_data/simplex_validation}"
 THREAD_COUNTS="${THREAD_COUNTS:-1 2 4 8}"
 
@@ -14,7 +14,7 @@ BARCODES="$DATASET/barcodes.tsv"
 SAMPLES="$DATASET/samples.tsv"
 
 if [[ ! -x "$SIMPLEX_BIN" ]]; then
-    echo "simplex binary not executable: $SIMPLEX_BIN" >&2
+    echo "plexless binary not executable: $SIMPLEX_BIN" >&2
     exit 1
 fi
 

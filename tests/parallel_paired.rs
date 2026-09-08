@@ -1,6 +1,6 @@
 mod common;
 
-use simplex::cli::DemuxArgs;
+use plexless::cli::DemuxArgs;
 
 use common::{TestDir, read_gzip_text};
 
@@ -74,21 +74,22 @@ fn parallel_paired_matches_serial_with_orphan_resynchronization() {
 
     let r1 = test.write("R1.fastq", &r1_text);
     let r2 = test.write("R2.fastq", &r2_text);
-    let serial_output = test.child("serial_output");
-    let parallel_output = test.child("parallel_output");
-
-    let serial_args = make_args(
-        r1.clone(),
-        r2.clone(),
-        barcodes.clone(),
-        samples.clone(),
-        serial_output.clone(),
-    );
-    let parallel_args = make_args(r1, r2, barcodes, samples, parallel_output.clone());
-
-    simplex::demux::run(serial_args).expect("Serial paired demultiplexing should succeed");
-    simplex::demux::run_with_threads(parallel_args, 4)
-        .expect("Parallel paired demultiplexing should succeed");
+    let outputs: Vec<_> = [1usize, 2, 8]
+        .into_iter()
+        .map(|threads| {
+            let output = test.child(&format!("threads_{threads}"));
+            let args = make_args(
+                r1.clone(),
+                r2.clone(),
+                barcodes.clone(),
+                samples.clone(),
+                output.clone(),
+            );
+            plexless::demux::run_with_threads(args, threads)
+                .unwrap_or_else(|error| panic!("{threads}-thread demultiplexing failed: {error}"));
+            output
+        })
+        .collect();
 
     for filename in [
         "sample_1_R1.fastq.gz",
@@ -96,24 +97,28 @@ fn parallel_paired_matches_serial_with_orphan_resynchronization() {
         "unassigned_R1.fastq.gz",
         "fastq_stats.tsv",
     ] {
-        let serial_path = serial_output.join(filename);
-        let parallel_path = parallel_output.join(filename);
-
-        if filename.ends_with(".gz") {
-            assert_eq!(
-                read_gzip_text(&serial_path),
-                read_gzip_text(&parallel_path),
-                "parallel output differs for {filename}"
-            );
+        let expected = if filename.ends_with(".gz") {
+            read_gzip_text(&outputs[0].join(filename))
         } else {
+            std::fs::read_to_string(outputs[0].join(filename)).expect("Could not read stats")
+        };
+
+        for (index, output) in outputs.iter().enumerate().skip(1) {
+            let observed = if filename.ends_with(".gz") {
+                read_gzip_text(&output.join(filename))
+            } else {
+                std::fs::read_to_string(output.join(filename)).expect("Could not read stats")
+            };
             assert_eq!(
-                std::fs::read_to_string(&serial_path).expect("Could not read serial stats"),
-                std::fs::read_to_string(&parallel_path).expect("Could not read parallel stats"),
-                "parallel stats differ"
+                expected,
+                observed,
+                "{}-thread output differs for {filename}",
+                [1usize, 2, 8][index]
             );
         }
     }
 
-    assert!(!serial_output.join("unassigned_R2.fastq.gz").exists());
-    assert!(!parallel_output.join("unassigned_R2.fastq.gz").exists());
+    for output in outputs {
+        assert!(!output.join("unassigned_R2.fastq.gz").exists());
+    }
 }

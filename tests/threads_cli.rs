@@ -1,5 +1,5 @@
 use clap::Parser;
-use simplex::cli::Cli;
+use plexless::cli::Cli;
 
 #[test]
 fn threads_is_a_global_demux_option() {

@@ -1,4 +1,4 @@
-# simplex validation suite
+# plexless validation suite
 
 Keep these files under `scripts/validation/`.
 

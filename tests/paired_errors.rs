@@ -1,6 +1,6 @@
 mod common;
 
-use simplex::cli::DemuxArgs;
+use plexless::cli::DemuxArgs;
 
 use common::{TestDir, read_gzip_text};
 
@@ -76,7 +76,7 @@ fn missing_r2_mate_becomes_r1_orphan_and_processing_resynchronizes() {
 
     let output = args.output.clone();
 
-    simplex::demux::run(args).expect("R1 orphan should not abort paired demultiplexing");
+    plexless::demux::run(args).expect("R1 orphan should not abort paired demultiplexing");
 
     assert_eq!(
         read_gzip_text(&output.join("sample_1_R1.fastq.gz")),
@@ -130,7 +130,7 @@ fn missing_r1_mate_becomes_r2_orphan_and_processing_resynchronizes() {
 
     let output = args.output.clone();
 
-    simplex::demux::run(args).expect("R2 orphan should not abort paired demultiplexing");
+    plexless::demux::run(args).expect("R2 orphan should not abort paired demultiplexing");
 
     assert_eq!(
         read_gzip_text(&output.join("unassigned_R2.fastq.gz")),
@@ -168,7 +168,7 @@ fn trailing_r1_record_is_orphan_not_fatal_error() {
 
     let output = args.output.clone();
 
-    simplex::demux::run(args).expect("Trailing R1 should be treated as an orphan");
+    plexless::demux::run(args).expect("Trailing R1 should be treated as an orphan");
 
     assert_eq!(
         read_gzip_text(&output.join("unassigned_R1.fastq.gz")),
@@ -200,7 +200,7 @@ fn trailing_r2_record_is_orphan_not_fatal_error() {
 
     let output = args.output.clone();
 
-    simplex::demux::run(args).expect("Trailing R2 should be treated as an orphan");
+    plexless::demux::run(args).expect("Trailing R2 should be treated as an orphan");
 
     assert_eq!(
         read_gzip_text(&output.join("unassigned_R2.fastq.gz")),
@@ -240,7 +240,7 @@ fn orphan_recovery_does_not_require_unassigned_output() {
 
     let output = args.output.clone();
 
-    simplex::demux::run(args)
+    plexless::demux::run(args)
         .expect("Orphan recovery should work even when unassigned output is disabled");
 
     assert!(!output.join("unassigned_R1.fastq.gz").exists());

@@ -1,7 +1,7 @@
 mod common;
 
-use simplex::samples::{Sample, SampleSheet};
-use simplex::writer::{OutputMate, WriterManager};
+use plexless::samples::{Sample, SampleSheet};
+use plexless::writer::{OutputMate, WriterManager};
 
 use common::{TestDir, read_gzip_text};
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deep validation of simplex output against truth.tsv.gz.
+Deep validation of plexless output against truth.tsv.gz.
 
 Checks:
   * every assigned read ID is in the expected sample
