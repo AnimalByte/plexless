@@ -33,9 +33,14 @@ fn single_args(reads: PathBuf, barcodes: PathBuf, samples: PathBuf, output: Path
         samples,
         output,
         compression_level: 2,
+        output_mode: plexless::cli::OutputMode::Buffered,
+        output_chunk_size: plexless::cli::ByteSizeSetting::Auto,
+        output_buffer_memory: plexless::cli::ByteSizeSetting::Auto,
+        max_open_files: None,
         max_mismatches: 1,
         fastq_stats: true,
         write_unassigned: true,
+        low_sample_fraction: 0.05,
     }
 }
 
@@ -57,9 +62,14 @@ fn paired_args(
         samples,
         output,
         compression_level: 2,
+        output_mode: plexless::cli::OutputMode::Buffered,
+        output_chunk_size: plexless::cli::ByteSizeSetting::Auto,
+        output_buffer_memory: plexless::cli::ByteSizeSetting::Auto,
+        max_open_files: None,
         max_mismatches: 1,
         fastq_stats: true,
         write_unassigned: true,
+        low_sample_fraction: 0.05,
     }
 }
 
@@ -237,14 +247,15 @@ fn automatic_parallel_gzip_rejects_corrupt_footer() {
     compressed[crc_index] ^= 0xff;
     fs::write(&reads, compressed).expect("Could not corrupt gzip fixture");
 
-    let error = plexless::demux::run_with_threads(
-        single_args(reads, barcodes, samples, test.child("parallel")),
-        8,
-    )
-    .expect_err("Corrupt gzip input must fail");
+    let output = test.child("parallel");
+    let error =
+        plexless::demux::run_with_threads(single_args(reads, barcodes, samples, output.clone()), 8)
+            .expect_err("Corrupt gzip input must fail");
 
     assert!(
         !error.trim().is_empty(),
         "Corrupt gzip failure should include an error message"
     );
+    assert!(output.join("PLEXLESS_INCOMPLETE").is_file());
+    assert!(!output.join("sample_metrics.tsv").exists());
 }

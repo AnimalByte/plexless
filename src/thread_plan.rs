@@ -42,7 +42,10 @@ impl ThreadPlan {
                     shared_slots.div_ceil(4).max(2)
                 };
 
-                let max_input_threads = shared_slots - 1;
+                // Routing and output compression are separate live stages.
+                // Reserve one shared slot for each before allowing adaptive
+                // input decompression to grow.
+                let max_input_threads = shared_slots - 2;
                 let initial_input_threads = desired_input.min(max_input_threads);
                 let initial_worker_threads = shared_slots - initial_input_threads;
 
@@ -57,7 +60,10 @@ impl ThreadPlan {
             };
 
         let worker_headroom = if adaptive {
-            requested_threads
+            // Input decompression never drops below one active worker, so the
+            // remaining shared slots are the maximum routing/compression
+            // allocation that can become active.
+            shared_slots - 1
         } else {
             initial_worker_threads
         };
@@ -169,7 +175,7 @@ mod tests {
                 plan.initial_worker_threads,
                 plan.worker_headroom,
             ),
-            (1, 2, 5, 8)
+            (1, 2, 5, 6)
         );
         assert!(plan.parallel_gzip);
         assert!(plan.adaptive);
@@ -185,7 +191,7 @@ mod tests {
                 plan.initial_worker_threads,
                 plan.worker_headroom,
             ),
-            (2, 2, 4, 8)
+            (2, 2, 4, 5)
         );
         assert!(plan.parallel_gzip);
         assert!(plan.adaptive);
@@ -270,5 +276,19 @@ mod tests {
                 worker_threads: 4,
             })
         );
+    }
+
+    #[test]
+    fn adaptive_input_growth_preserves_two_output_pipeline_workers() {
+        let plan = ThreadPlan::new(8, false, true).unwrap();
+        let mut allocation = plan.adaptive_allocation().unwrap();
+
+        for _ in 0..12 {
+            allocation.observe(0, 16);
+        }
+
+        let current = allocation.current();
+        assert_eq!(current.input_threads, 5);
+        assert_eq!(current.worker_threads, 2);
     }
 }

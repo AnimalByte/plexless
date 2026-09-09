@@ -7,13 +7,19 @@ use crate::barcodes::BarcodeCatalog;
 use crate::cli::DemuxArgs;
 use crate::fastq::InputReader;
 use crate::input::{InputFiles, resolve_inputs};
+use crate::output::{
+    OutputLayout, ResolvedOutputMode, available_memory_bytes, calculate_output_buffer_policy,
+    report_output_mode, resolve_output_mode,
+};
 use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
 use crate::stats::FastqStats;
 use crate::structure::ReadLayout;
-use crate::writer::{OutputMate, WriterManager};
+use crate::writer::{
+    DirectWriterManager, OutputMate, OutputRunMarker, WriterCompletion, WriterManager,
+    resolve_max_open_files,
+};
 
-const MAX_OPEN_WRITERS: usize = 64;
 const PAIRED_RESYNC_WINDOW: usize = 1024;
 
 #[derive(Debug, Default)]
@@ -36,6 +42,47 @@ impl DemuxCounts {
         self.short_reads += other.short_reads;
         self.orphan_r1 += other.orphan_r1;
         self.orphan_r2 += other.orphan_r2;
+    }
+}
+
+enum SerialWriter {
+    Direct(DirectWriterManager),
+    Buffered(WriterManager),
+}
+
+impl SerialWriter {
+    fn write_sample(
+        &mut self,
+        sample_id: u32,
+        mate: OutputMate,
+        id: &[u8],
+        seq: &[u8],
+        qual: &[u8],
+    ) -> Result<(), String> {
+        match self {
+            Self::Direct(writer) => writer.write_sample(sample_id, mate, id, seq, qual),
+            Self::Buffered(writer) => writer.write_sample(sample_id, mate, id, seq, qual),
+        }
+    }
+
+    fn write_unassigned(
+        &mut self,
+        mate: OutputMate,
+        id: &[u8],
+        seq: &[u8],
+        qual: &[u8],
+    ) -> Result<(), String> {
+        match self {
+            Self::Direct(writer) => writer.write_unassigned(mate, id, seq, qual),
+            Self::Buffered(writer) => writer.write_unassigned(mate, id, seq, qual),
+        }
+    }
+
+    fn finish_with_qc(self) -> Result<WriterCompletion, String> {
+        match self {
+            Self::Direct(writer) => writer.finish_with_qc(),
+            Self::Buffered(writer) => writer.finish_with_qc(),
+        }
     }
 }
 
@@ -74,15 +121,50 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
     let routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
 
     let output_dir = args.output.clone();
-
-    let mut writer = WriterManager::new(
-        args.output,
-        &samples,
-        paired,
-        args.write_unassigned,
-        MAX_OPEN_WRITERS,
-        args.compression_level,
-    )?;
+    let output_layout = OutputLayout::new(samples.samples.len(), paired, args.write_unassigned);
+    let expected_streams = output_layout.stream_count()?;
+    let output_mode = resolve_output_mode(args.output_mode, expected_streams)?;
+    report_output_mode(args.output_mode, output_mode, expected_streams);
+    let max_open_files = resolve_max_open_files(expected_streams, args.max_open_files)?;
+    let mut writer = match output_mode {
+        ResolvedOutputMode::Direct => {
+            eprintln!("Output writers: max-open-files={max_open_files}");
+            SerialWriter::Direct(DirectWriterManager::new(
+                args.output,
+                &samples,
+                paired,
+                args.write_unassigned,
+                max_open_files,
+                args.compression_level,
+            )?)
+        }
+        ResolvedOutputMode::Buffered => {
+            let output_policy = calculate_output_buffer_policy(
+                expected_streams,
+                available_memory_bytes().unwrap_or(512 * 1024 * 1024),
+                args.output_chunk_size.explicit_bytes(),
+                args.output_buffer_memory.explicit_bytes(),
+            )?;
+            eprintln!(
+                "Output buffering: streams={} chunk={} bytes budget={} bytes max-open-files={}",
+                output_policy.expected_streams,
+                output_policy.chunk_size,
+                output_policy.memory_budget,
+                max_open_files,
+            );
+            SerialWriter::Buffered(WriterManager::new_with_policy(
+                args.output,
+                &samples,
+                paired,
+                args.write_unassigned,
+                max_open_files,
+                args.compression_level,
+                output_policy.chunk_size,
+                output_policy.memory_budget,
+            )?)
+        }
+    };
+    let run_marker = OutputRunMarker::begin(&output_dir)?;
 
     let mut r1_stats = if args.fastq_stats {
         Some(FastqStats::default())
@@ -113,14 +195,75 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
         )?,
     }
 
-    writer.finish()?;
+    let completion = writer.finish_with_qc()?;
+    completion.sample_qc.verify(counts.assigned)?;
+    verify_serial_unassigned_counts(
+        &counts,
+        paired,
+        args.write_unassigned,
+        completion.unassigned_records,
+    )?;
 
     if let Some(r1) = &r1_stats {
         write_fastq_stats(&output_dir, r1, r2_stats.as_ref())?;
     }
 
-    print_summary(&counts);
+    let qc_summary =
+        completion
+            .sample_qc
+            .write_report(&output_dir, &samples, args.low_sample_fraction)?;
 
+    run_marker.complete()?;
+
+    print_summary(&counts);
+    eprintln!("  expected samples:  {}", qc_summary.expected);
+    eprintln!("  populated samples: {}", qc_summary.populated);
+    eprintln!("  missing samples:   {}", qc_summary.missing);
+    eprintln!("  low samples:       {}", qc_summary.low);
+    eprintln!(
+        "  gzip chunks: {} ({:.1} KiB average uncompressed, {} compressed bytes)",
+        completion.chunks,
+        if completion.chunks == 0 {
+            0.0
+        } else {
+            completion.uncompressed_bytes as f64 / completion.chunks as f64 / 1024.0
+        },
+        completion.compressed_bytes,
+    );
+
+    Ok(())
+}
+
+fn verify_serial_unassigned_counts(
+    counts: &DemuxCounts,
+    paired: bool,
+    write_unassigned: bool,
+    observed_records: u64,
+) -> Result<(), String> {
+    if !write_unassigned {
+        return (observed_records == 0)
+            .then_some(())
+            .ok_or_else(|| "Unassigned records were emitted while output was disabled".into());
+    }
+    let classified = counts
+        .unmatched
+        .checked_add(counts.ambiguous)
+        .and_then(|value| value.checked_add(counts.unrouted))
+        .ok_or("Unassigned count overflow")?;
+    let expected = if paired {
+        classified
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(counts.orphan_r1))
+            .and_then(|value| value.checked_add(counts.orphan_r2))
+            .ok_or("Unassigned output count overflow")?
+    } else {
+        classified
+    };
+    if expected != observed_records {
+        return Err(format!(
+            "Unassigned-count reconciliation failed: expected={expected}, output={observed_records}"
+        ));
+    }
     Ok(())
 }
 
@@ -128,11 +271,11 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
 fn run_single(
     path: &Path,
     routing: &RoutingTree,
-    writer: &mut WriterManager,
+    writer: &mut SerialWriter,
     mut stats: Option<&mut FastqStats>,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let mut reader = InputReader::open(path);
+    let mut reader = InputReader::try_open(path)?;
 
     let prefix_len = routing.r1_prefix_len();
 
@@ -244,7 +387,7 @@ fn read_owned_record(
 }
 
 fn write_orphan_parts(
-    writer: &mut WriterManager,
+    writer: &mut SerialWriter,
     mate: OutputMate,
     id: &[u8],
     seq: &[u8],
@@ -263,7 +406,7 @@ fn write_orphan_parts(
 }
 
 fn write_owned_orphan(
-    writer: &mut WriterManager,
+    writer: &mut SerialWriter,
     mate: OutputMate,
     record: OwnedFastqRecord,
     counts: &mut DemuxCounts,
@@ -275,7 +418,7 @@ fn drain_owned_orphans(
     queue: &mut VecDeque<OwnedFastqRecord>,
     count: usize,
     mate: OutputMate,
-    writer: &mut WriterManager,
+    writer: &mut SerialWriter,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
     for _ in 0..count {
@@ -294,7 +437,7 @@ fn drain_reader_as_orphans(
     path: &Path,
     mate: OutputMate,
     mut stats: Option<&mut FastqStats>,
-    writer: &mut WriterManager,
+    writer: &mut SerialWriter,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
     while let Some(record) = reader.next_record() {
@@ -360,7 +503,7 @@ fn process_pair_parts(
     r2_seq: &[u8],
     r2_qual: &[u8],
     routing: &RoutingTree,
-    writer: &mut WriterManager,
+    writer: &mut SerialWriter,
     r1_prefix: usize,
     r2_prefix: usize,
     counts: &mut DemuxCounts,
@@ -424,7 +567,7 @@ fn recover_pairing(
     r1_path: &Path,
     r2_path: &Path,
     routing: &RoutingTree,
-    writer: &mut WriterManager,
+    writer: &mut SerialWriter,
     r1_prefix: usize,
     r2_prefix: usize,
     mut r1_stats: Option<&mut FastqStats>,
@@ -567,13 +710,13 @@ fn run_paired(
     r1_path: &Path,
     r2_path: &Path,
     routing: &RoutingTree,
-    writer: &mut WriterManager,
+    writer: &mut SerialWriter,
     mut r1_stats: Option<&mut FastqStats>,
     mut r2_stats: Option<&mut FastqStats>,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let mut r1_reader = InputReader::open(r1_path);
-    let mut r2_reader = InputReader::open(r2_path);
+    let mut r1_reader = InputReader::try_open(r1_path)?;
+    let mut r2_reader = InputReader::try_open(r2_path)?;
 
     let (r1_prefix, r2_prefix) = (routing.r1_prefix_len(), routing.r2_prefix_len());
 
@@ -748,6 +891,9 @@ pub(crate) fn write_fastq_stats(
     if let Some(r2) = r2 {
         write_stats_row(&mut file, "R2", r2)?;
     }
+
+    file.flush()
+        .map_err(|e| format!("Could not flush FASTQ stats: {e}"))?;
 
     Ok(())
 }

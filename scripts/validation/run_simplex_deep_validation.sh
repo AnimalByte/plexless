@@ -61,6 +61,11 @@ for mode in se pe; do
                 2> >(tee "$log" >&2)
         fi
 
+        if [[ -e "$out/PLEXLESS_INCOMPLETE" ]]; then
+            echo "Successful run retained $out/PLEXLESS_INCOMPLETE" >&2
+            exit 1
+        fi
+
         python3 "$VERIFY_SUMMARY" "$EXPECTED" "$log"
 
         if [[ "$threads" == "1" ]]; then

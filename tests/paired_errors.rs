@@ -38,9 +38,14 @@ fn paired_args(
         samples,
         output: test.child(&format!("{name}_output")),
         compression_level: 2,
+        output_mode: plexless::cli::OutputMode::Buffered,
+        output_chunk_size: plexless::cli::ByteSizeSetting::Auto,
+        output_buffer_memory: plexless::cli::ByteSizeSetting::Auto,
+        max_open_files: None,
         max_mismatches: 1,
         fastq_stats: false,
         write_unassigned,
+        low_sample_fraction: 0.05,
     }
 }
 

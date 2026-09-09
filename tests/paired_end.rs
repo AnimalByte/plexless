@@ -50,9 +50,14 @@ fn paired_end_demux_combines_a_and_b_across_mates_and_trims_t_from_each_mate() {
         samples,
         output: output.clone(),
         compression_level: 2,
+        output_mode: plexless::cli::OutputMode::Buffered,
+        output_chunk_size: plexless::cli::ByteSizeSetting::Auto,
+        output_buffer_memory: plexless::cli::ByteSizeSetting::Auto,
+        max_open_files: None,
         max_mismatches: 1,
         fastq_stats: false,
         write_unassigned: false,
+        low_sample_fraction: 0.05,
     };
 
     args.validate().expect("CLI arguments should be valid");

@@ -39,6 +39,8 @@ A_BARCODES = [
     ("A02", "CCCC"),
     ("A03", "GGGG"),
     ("A04", "TTTT"),
+    # Correction-safe but deliberately absent from every sample route.
+    ("A05", "ACGT"),
 ]
 
 B_BARCODES = [
@@ -55,12 +57,12 @@ SAMPLES = [
     ("sample_4", "A04", "B04"),
 ]
 
-# Valid barcodes, but combinations deliberately absent from samples.tsv.
+# A valid unused root barcode produces the RoutingTree Unrouted terminal.
 UNROUTED_COMBINATIONS = [
-    ("A01", "B02"),
-    ("A02", "B03"),
-    ("A03", "B04"),
-    ("A04", "B01"),
+    ("A05", "B01"),
+    ("A05", "B02"),
+    ("A05", "B03"),
+    ("A05", "B04"),
 ]
 
 # Hamming distance >= 2 from every A whitelist barcode, so it cannot be

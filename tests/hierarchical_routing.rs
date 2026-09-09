@@ -64,7 +64,8 @@ fn basic_hierarchical_exact_routing() {
         route(&tree, "CCCCTTTT"),
         RouteResult::Assigned { sample_id: 3 }
     );
-    assert_eq!(tree.node_count(), 3);
+    assert!(tree.is_dense());
+    assert_eq!(tree.node_count(), 2);
 }
 
 #[test]
@@ -85,12 +86,53 @@ fn child_sequence_reuse_is_allowed_across_parent_namespaces() {
     )
     .expect("Reused child sequence should compile in independent namespaces");
 
+    assert!(!tree.is_dense());
+
     assert_eq!(
         route(&tree, "AAAAACTG"),
         RouteResult::Assigned { sample_id: 0 }
     );
     assert_eq!(
         route(&tree, "CCCCACTG"),
+        RouteResult::Assigned { sample_id: 1 }
+    );
+}
+
+#[test]
+fn dense_grid_maps_shuffled_rows_and_preserves_n_correction() {
+    let test = TestDir::new("dense-grid");
+    let tree = compile_tree(
+        &test,
+        "R1_4A4B",
+        "Set\tID\tSequence\n\
+         A\tA1\tAAAA\n\
+         A\tA2\tCCCC\n\
+         B\tB1\tGGGG\n\
+         B\tB2\tTTTT\n",
+        "Sample\tA\tB\n\
+         sample3\tA2\tB2\n\
+         sample1\tA1\tB1\n\
+         sample4\tA2\tB1\n\
+         sample2\tA1\tB2\n",
+        1,
+    )
+    .expect("Dense grid should compile");
+
+    assert!(tree.is_dense());
+    assert_eq!(
+        route(&tree, "AAAAGGGG"),
+        RouteResult::Assigned { sample_id: 1 }
+    );
+    assert_eq!(
+        route(&tree, "AAAATTTT"),
+        RouteResult::Assigned { sample_id: 3 }
+    );
+    assert_eq!(
+        route(&tree, "CCCCTTTT"),
+        RouteResult::Assigned { sample_id: 0 }
+    );
+    assert_eq!(
+        route(&tree, "AAANGGGN"),
         RouteResult::Assigned { sample_id: 1 }
     );
 }

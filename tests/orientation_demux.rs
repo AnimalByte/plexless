@@ -24,9 +24,14 @@ fn paired_reverse_complement_piece_routes_and_trims_each_mate() {
         samples,
         output: output.clone(),
         compression_level: 2,
+        output_mode: plexless::cli::OutputMode::Buffered,
+        output_chunk_size: plexless::cli::ByteSizeSetting::Auto,
+        output_buffer_memory: plexless::cli::ByteSizeSetting::Auto,
+        max_open_files: None,
         max_mismatches: 0,
         fastq_stats: false,
         write_unassigned: false,
+        low_sample_fraction: 0.05,
     })
     .expect("Reverse-complement demultiplexing should succeed");
 
@@ -64,9 +69,14 @@ fn asymmetric_paired_layout_assembles_repeated_a_and_trims_independently() {
         samples,
         output: output.clone(),
         compression_level: 2,
+        output_mode: plexless::cli::OutputMode::Buffered,
+        output_chunk_size: plexless::cli::ByteSizeSetting::Auto,
+        output_buffer_memory: plexless::cli::ByteSizeSetting::Auto,
+        max_open_files: None,
         max_mismatches: 0,
         fastq_stats: false,
         write_unassigned: false,
+        low_sample_fraction: 0.05,
     })
     .expect("Asymmetric paired demultiplexing should succeed");
 
