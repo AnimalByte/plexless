@@ -30,8 +30,7 @@ participate in matching or mismatch-safety validation.
 
 ### Download the prebuilt binary
 
-Plexless is hosted in a private GitHub repository, so downloads require an
-account with repository access. Install the
+Plexless is hosted in a public GitHub repository. Install the
 [GitHub CLI](https://cli.github.com/), authenticate, and download the Linux
 x86-64 release:
 
@@ -55,7 +54,7 @@ plexless --help
 ```
 
 Users with repository access can also download the archive in a browser from
-the [private releases page](https://github.com/AnimalByte/plexless/releases).
+the [public releases page](https://github.com/AnimalByte/plexless/releases).
 The release archive includes a compatibility executable named `simplex` for
 existing command lines.
 
@@ -78,7 +77,7 @@ sudo dnf install zlib-devel
 sudo pacman -S zlib
 ```
 
-Authenticate to GitHub, clone the private repository, and build:
+Authenticate to GitHub, clone the public repository, and build:
 
 ```bash
 gh auth login
