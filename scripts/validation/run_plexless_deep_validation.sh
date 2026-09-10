@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SIMPLEX_BIN="${PLEXLESS_BIN:-${SIMPLEX_BIN:-./target/release/plexless}}"
-DATASET="${DATASET:-$HOME/simplex_validation_data/simplex_validation}"
+PLEXLESS_BIN="${PLEXLESS_BIN:-./target/release/plexless}"
+DATASET="${DATASET:-$HOME/plexless_validation_data/plexless_validation}"
 THREAD_COUNTS="${THREAD_COUNTS:-1 2 4 8}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERIFY_SUMMARY="$ROOT/verify_simplex_summary.py"
-VERIFY_OUTPUTS="$ROOT/verify_simplex_outputs.py"
+VERIFY_SUMMARY="$ROOT/verify_plexless_summary.py"
+VERIFY_OUTPUTS="$ROOT/verify_plexless_outputs.py"
 
 EXPECTED="$DATASET/expected_summary.tsv"
 BARCODES="$DATASET/barcodes.tsv"
 SAMPLES="$DATASET/samples.tsv"
 
-if [[ ! -x "$SIMPLEX_BIN" ]]; then
-    echo "plexless binary not executable: $SIMPLEX_BIN" >&2
+if [[ ! -x "$PLEXLESS_BIN" ]]; then
+    echo "plexless binary not executable: $PLEXLESS_BIN" >&2
     exit 1
 fi
 
@@ -36,7 +36,7 @@ for mode in se pe; do
         echo "--- threads=$threads ---"
 
         if [[ "$mode" == "se" ]]; then
-            "$SIMPLEX_BIN" \
+            "$PLEXLESS_BIN" \
                 --threads "$threads" \
                 demux \
                 --reads "$DATASET/se.fastq.gz" \
@@ -47,7 +47,7 @@ for mode in se pe; do
                 --output "$out" \
                 2> >(tee "$log" >&2)
         else
-            "$SIMPLEX_BIN" \
+            "$PLEXLESS_BIN" \
                 --threads "$threads" \
                 demux \
                 --r1 "$DATASET/pe_R1.fastq.gz" \

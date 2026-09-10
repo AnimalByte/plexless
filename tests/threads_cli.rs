@@ -23,7 +23,7 @@ fn parse_demux(extra: &[&str]) -> Cli {
 #[test]
 fn threads_is_a_global_demux_option() {
     let cli = Cli::try_parse_from([
-        "simplex",
+        "plexless",
         "demux",
         "--threads",
         "4",
@@ -81,7 +81,7 @@ fn advanced_output_and_qc_options_parse_human_sizes() {
 #[test]
 fn zero_threads_is_rejected() {
     let result = Cli::try_parse_from([
-        "simplex",
+        "plexless",
         "demux",
         "--threads",
         "0",

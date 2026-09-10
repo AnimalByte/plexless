@@ -1,8 +1,8 @@
 # Processing architecture
 
-## Imported simplex data flow
+## Streaming data flow
 
-The imported implementation already had a sound streaming pipeline:
+Plexless uses a bounded streaming pipeline:
 
 ```text
 FASTQ input
@@ -16,20 +16,7 @@ FASTQ input
 Paired input validates normalized record IDs and uses bounded lookahead to
 resynchronize, emitting records present in only one input as orphans. Assigned
 reads have each mate's declared structured prefix trimmed; unassigned and
-orphan reads remain untrimmed. Those parts of the pipeline are unchanged.
-
-The imported matching path was flat:
-
-```text
-scan structures and assemble every symbol
-  -> decode each symbol against its complete global whitelist
-  -> collect decoder IDs in a fixed [DecodeResult; 3]
-  -> allocate Vec<u32>
-  -> HashMap<Vec<u32>, sample_id>
-```
-
-That made unrelated child namespaces participate in correction validation and
-matching.
+orphan reads remain untrimmed.
 
 ## Compiled hierarchical model
 
@@ -209,7 +196,8 @@ lookups. An error identifies the parent path plus both conflicting IDs.
 
 Consequently, close or identical child sequences are allowed in independent
 parent namespaces. They conflict only when both are candidates in the same
-node. This is the defining difference from the imported global-decoder model.
+node. This keeps correction validation scoped to barcodes that can compete at
+the same routing position.
 
 ## Extension point
 

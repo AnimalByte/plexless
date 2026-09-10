@@ -10,6 +10,9 @@ matched only against B barcodes reachable beneath that A; C is then matched
 only beneath the resolved A/B path, and so on. Unrelated child namespaces never
 participate in matching or mismatch-safety validation.
 
+Plexless is under active development. Validate demultiplexing results against
+an established workflow before using it in production or clinical pipelines.
+
 ## Highlights
 
 - True hierarchical routing compiled once at startup
@@ -28,43 +31,9 @@ participate in matching or mismatch-safety validation.
 
 ## Installation
 
-### Download the prebuilt binary
-
-Plexless is hosted in a public GitHub repository. Install the
-[GitHub CLI](https://cli.github.com/), authenticate, and download the Linux
-x86-64 release:
-
-```bash
-gh auth login
-gh release download v0.3.0 \
-  --repo AnimalByte/plexless \
-  --pattern 'plexless-v0.3.0-x86_64-unknown-linux-gnu.tar.gz'
-
-tar -xzf plexless-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
-mkdir -p "$HOME/.local/bin"
-install -m 0755 \
-  plexless-v0.3.0-x86_64-unknown-linux-gnu/plexless \
-  "$HOME/.local/bin/plexless"
-```
-
-Ensure `$HOME/.local/bin` is on `PATH`, then verify the installation:
-
-```bash
-plexless --help
-```
-
-Users with repository access can also download the archive in a browser from
-the [public releases page](https://github.com/AnimalByte/plexless/releases).
-The release archive includes a compatibility executable named `simplex` for
-existing command lines.
-
-The Linux binaries dynamically use the standard `libz.so.1` runtime library,
-which is installed by default on most distributions (`zlib1g` on
-Ubuntu/Debian and `zlib` on Fedora/Arch).
-
-### Build from source
-
-A recent stable Rust toolchain and zlib development package are required.
+Plexless links against the system zlib library. Installing from crates.io or
+building from source requires a recent stable Rust toolchain, Cargo, and the
+zlib development package:
 
 ```bash
 # Ubuntu/Debian
@@ -77,21 +46,51 @@ sudo dnf install zlib-devel
 sudo pacman -S zlib
 ```
 
-Authenticate to GitHub, clone the public repository, and build:
+### Install from crates.io
+
+Install Plexless and verify the CLI:
 
 ```bash
-gh auth login
-gh repo clone AnimalByte/plexless
+cargo install plexless
+plexless --help
+```
+
+`cargo install plexless` installs only the `plexless` executable into Cargo's
+binary directory, normally `$HOME/.cargo/bin`.
+
+### Download a prebuilt binary
+
+Linux x86-64 archives are available from the public
+[GitHub releases page](https://github.com/AnimalByte/plexless/releases). After
+downloading the archive for the desired version:
+
+```bash
+tar -xzf plexless-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 \
+  plexless-vX.Y.Z-x86_64-unknown-linux-gnu/plexless \
+  "$HOME/.local/bin/plexless"
+plexless --help
+```
+
+Prebuilt Linux binaries require the zlib runtime library (`zlib1g` on
+Ubuntu/Debian and `zlib` on Fedora/Arch).
+
+### Build from source
+
+Clone the public repository and build an optimized binary:
+
+```bash
+git clone https://github.com/AnimalByte/plexless.git
 cd plexless
 cargo build --release
 ```
 
-The primary executable is `target/release/plexless`. To install it for your
-user:
+The resulting executable is `target/release/plexless`. Alternatively, install
+the current checkout through Cargo:
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-install -m 0755 target/release/plexless "$HOME/.local/bin/plexless"
+cargo install --path .
 ```
 
 ## Command-line reference
@@ -104,9 +103,8 @@ plexless [--threads <N>] demux [OPTIONS] \
   <--reads <FASTQ> | --r1 <FASTQ> --r2 <FASTQ>>
 ```
 
-`--threads` is global and may also appear after `demux`. The compatibility
-executable `simplex` accepts the same command line. Show the authoritative help
-for the installed version with:
+`--threads` is global and may also appear after `demux`. Show the authoritative
+help for the installed version with:
 
 ```bash
 plexless --help
@@ -466,3 +464,8 @@ cargo test --all
 cargo build --release --all-targets
 cargo test --release
 ```
+
+## License
+
+Plexless is dual-licensed under the Apache License, Version 2.0, or the MIT
+license, at your option. See `LICENSE-APACHE` and `LICENSE-MIT`.

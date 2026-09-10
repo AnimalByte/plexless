@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--r1", type=Path, default=Path("raw_R1.fastq.gz"))
     p.add_argument("--r2", type=Path, default=Path("raw_R2.fastq.gz"))
-    p.add_argument("--outdir", type=Path, default=Path("simplex_validation"))
+    p.add_argument("--outdir", type=Path, default=Path("plexless_validation"))
     p.add_argument("--limit", type=int, default=None)
     p.add_argument(
         "--gzip-level",
