@@ -101,6 +101,7 @@ fn parallel_paired_matches_serial_with_orphan_resynchronization() {
         "sample_1_R2.fastq.gz",
         "unassigned_R1.fastq.gz",
         "fastq_stats.tsv",
+        "barcode_stats.tsv",
     ] {
         let expected = if filename.ends_with(".gz") {
             read_gzip_text(&outputs[0].join(filename))

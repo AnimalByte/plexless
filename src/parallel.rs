@@ -26,7 +26,7 @@ use crate::parallel_input::ParallelInput;
 use crate::qc::{SampleQc, SampleQcSummary};
 use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
-use crate::stats::FastqStats;
+use crate::stats::MateQcStats;
 use crate::structure::ReadLayout;
 use crate::thread_plan::{AdaptiveAllocation, AllocationSnapshot, ThreadPlan};
 use crate::writer::{CompressedWriterManager, OutputRunMarker, resolve_max_open_files};
@@ -842,6 +842,9 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
     let catalog = BarcodeCatalog::load(&args.barcodes, &layout)?;
     let samples = SampleSheet::load(&args.samples, &layout, &catalog)?;
     let routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
+    let (r1_qc, r2_qc) = MateQcStats::for_layout(&layout);
+    let mut r1_stats = args.fastq_stats.then_some(r1_qc);
+    let mut r2_stats = if args.fastq_stats { r2_qc } else { None };
     let (r1_prefix, r2_prefix) = (routing.r1_prefix_len(), routing.r2_prefix_len());
     let output_layout = OutputLayout::new(samples.samples.len(), paired, args.write_unassigned);
     let expected_streams = output_layout.stream_count()?;
@@ -870,6 +873,8 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
             samples,
             max_open_files,
             control,
+            r1_stats,
+            r2_stats,
         );
     }
 
@@ -903,18 +908,6 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
         output_policy.memory_budget,
     )?;
     let run_marker = OutputRunMarker::begin(&output_dir)?;
-
-    let mut r1_stats = if args.fastq_stats {
-        Some(FastqStats::default())
-    } else {
-        None
-    };
-
-    let mut r2_stats = if paired && args.fastq_stats {
-        Some(FastqStats::default())
-    } else {
-        None
-    };
 
     let queue_capacity = worker_threads
         .checked_mul(QUEUE_DEPTH_PER_WORKER)
@@ -1188,6 +1181,8 @@ fn run_direct_parallel(
     samples: SampleSheet,
     max_open_files: usize,
     control: PipelineControl,
+    mut r1_stats: Option<MateQcStats>,
+    mut r2_stats: Option<MateQcStats>,
 ) -> Result<(), String> {
     let output_dir = args.output.clone();
     eprintln!("Output writers: max-open-files={max_open_files}");
@@ -1200,8 +1195,6 @@ fn run_direct_parallel(
         args.compression_level,
     )?;
     let run_marker = OutputRunMarker::begin(&output_dir)?;
-    let mut r1_stats = args.fastq_stats.then(FastqStats::default);
-    let mut r2_stats = (paired && args.fastq_stats).then(FastqStats::default);
     let worker_threads = thread_plan.initial_worker_threads;
     let worker_headroom = thread_plan.worker_headroom;
     let queue_capacity = worker_threads
@@ -2085,7 +2078,7 @@ fn print_chunk_summary(uncompressed_bytes: u64, writer: &WriterResult) {
 fn produce_single(
     path: &Path,
     batcher: &mut BatchSender,
-    mut stats: Option<&mut FastqStats>,
+    mut stats: Option<&mut MateQcStats>,
     parallel_input: &ParallelInput,
     control: &PipelineControl,
 ) -> Result<(), String> {
@@ -2157,7 +2150,7 @@ fn stream_owned_records(
 
 fn recv_owned_record(
     receiver: &Receiver<OwnedFastqRecord>,
-    stats: Option<&mut FastqStats>,
+    stats: Option<&mut MateQcStats>,
     control: &PipelineControl,
 ) -> Result<Option<OwnedFastqRecord>, String> {
     match recv_or_cancel(receiver, control)? {
@@ -2197,7 +2190,7 @@ fn drain_owned_orphans(
 fn drain_receiver_as_orphans(
     receiver: &Receiver<OwnedFastqRecord>,
     mate: OutputMate,
-    mut stats: Option<&mut FastqStats>,
+    mut stats: Option<&mut MateQcStats>,
     batcher: &mut BatchSender,
     control: &PipelineControl,
 ) -> Result<(), String> {
@@ -2246,8 +2239,8 @@ fn recover_pairing(
     r1_receiver: &Receiver<OwnedFastqRecord>,
     r2_receiver: &Receiver<OwnedFastqRecord>,
     batcher: &mut BatchSender,
-    mut r1_stats: Option<&mut FastqStats>,
-    mut r2_stats: Option<&mut FastqStats>,
+    mut r1_stats: Option<&mut MateQcStats>,
+    mut r2_stats: Option<&mut MateQcStats>,
     control: &PipelineControl,
 ) -> Result<(), String> {
     let mut r1_queue = VecDeque::from([first_r1]);
@@ -2360,8 +2353,8 @@ fn produce_paired_from_receivers(
     r1_receiver: &Receiver<OwnedFastqRecord>,
     r2_receiver: &Receiver<OwnedFastqRecord>,
     batcher: &mut BatchSender,
-    mut r1_stats: Option<&mut FastqStats>,
-    mut r2_stats: Option<&mut FastqStats>,
+    mut r1_stats: Option<&mut MateQcStats>,
+    mut r2_stats: Option<&mut MateQcStats>,
     control: &PipelineControl,
 ) -> Result<(), String> {
     loop {
@@ -2419,8 +2412,8 @@ fn produce_paired(
     r1_path: &Path,
     r2_path: &Path,
     batcher: &mut BatchSender,
-    r1_stats: Option<&mut FastqStats>,
-    r2_stats: Option<&mut FastqStats>,
+    r1_stats: Option<&mut MateQcStats>,
+    r2_stats: Option<&mut MateQcStats>,
     parallel_input: &ParallelInput,
     control: &PipelineControl,
 ) -> Result<(), String> {
@@ -2913,6 +2906,7 @@ mod tests {
         assert!(output.join(INCOMPLETE_RUN_MARKER).is_file());
         assert!(!output.join("sample_metrics.tsv").exists());
         assert!(!output.join("fastq_stats.tsv").exists());
+        assert!(!output.join("barcode_stats.tsv").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -131,6 +131,10 @@ fn automatic_parallel_gzip_single_end_matches_serial_reference() {
         &serial_output.join("fastq_stats.tsv"),
         &parallel_output.join("fastq_stats.tsv"),
     );
+    assert_same_text_file(
+        &serial_output.join("barcode_stats.tsv"),
+        &parallel_output.join("barcode_stats.tsv"),
+    );
 }
 
 #[test]
@@ -214,6 +218,36 @@ fn automatic_parallel_gzip_paired_end_preserves_pair_resync() {
     assert_same_text_file(
         &serial_output.join("fastq_stats.tsv"),
         &parallel_output.join("fastq_stats.tsv"),
+    );
+    assert_same_text_file(
+        &serial_output.join("barcode_stats.tsv"),
+        &parallel_output.join("barcode_stats.tsv"),
+    );
+
+    let stats = fs::read_to_string(serial_output.join("fastq_stats.tsv")).unwrap();
+    let mut rows = stats.lines().skip(1).map(|line| line.split('\t'));
+    let r1 = rows.next().unwrap().collect::<Vec<_>>();
+    let r2 = rows.next().unwrap().collect::<Vec<_>>();
+    assert_eq!(&r1[..3], ["R1", "2201", "8804"]);
+    assert_eq!(&r2[..3], ["R2", "2200", "8800"]);
+
+    let barcode_stats = fs::read_to_string(serial_output.join("barcode_stats.tsv")).unwrap();
+    let observed_counts = barcode_stats
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            (fields[0], fields[1], fields[6], fields[7])
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed_counts,
+        [
+            ("R1", "A", "2201", "4402"),
+            ("R1", "B", "2201", "4402"),
+            ("R2", "A", "2200", "4400"),
+            ("R2", "B", "2200", "4400"),
+        ]
     );
 }
 

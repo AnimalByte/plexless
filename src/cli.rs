@@ -186,7 +186,7 @@ pub struct DemuxArgs {
     #[arg(long, default_value_t = 1)]
     pub max_mismatches: u8,
 
-    /// Calculate FASTQ quality statistics
+    /// Write biological-read and barcode-region FASTQ statistics
     #[arg(long)]
     pub fastq_stats: bool,
 

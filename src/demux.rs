@@ -13,8 +13,8 @@ use crate::output::{
 };
 use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
-use crate::stats::FastqStats;
-use crate::structure::ReadLayout;
+use crate::stats::{FastqStats, MateQcStats};
+use crate::structure::{Orientation, ReadLayout};
 use crate::writer::{
     DirectWriterManager, OutputMate, OutputRunMarker, WriterCompletion, WriterManager,
     resolve_max_open_files,
@@ -166,17 +166,9 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
     };
     let run_marker = OutputRunMarker::begin(&output_dir)?;
 
-    let mut r1_stats = if args.fastq_stats {
-        Some(FastqStats::default())
-    } else {
-        None
-    };
-
-    let mut r2_stats = if paired && args.fastq_stats {
-        Some(FastqStats::default())
-    } else {
-        None
-    };
+    let (r1_qc, r2_qc) = MateQcStats::for_layout(&layout);
+    let mut r1_stats = args.fastq_stats.then_some(r1_qc);
+    let mut r2_stats = if args.fastq_stats { r2_qc } else { None };
 
     let mut counts = DemuxCounts::default();
 
@@ -272,7 +264,7 @@ fn run_single(
     path: &Path,
     routing: &RoutingTree,
     writer: &mut SerialWriter,
-    mut stats: Option<&mut FastqStats>,
+    mut stats: Option<&mut MateQcStats>,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
     let mut reader = InputReader::try_open(path)?;
@@ -364,7 +356,7 @@ impl OwnedFastqRecord {
 fn read_owned_record(
     reader: &mut InputReader,
     path: &Path,
-    stats: Option<&mut FastqStats>,
+    stats: Option<&mut MateQcStats>,
 ) -> Result<Option<OwnedFastqRecord>, String> {
     let Some(record) = reader.next_record() else {
         return Ok(None);
@@ -436,7 +428,7 @@ fn drain_reader_as_orphans(
     reader: &mut InputReader,
     path: &Path,
     mate: OutputMate,
-    mut stats: Option<&mut FastqStats>,
+    mut stats: Option<&mut MateQcStats>,
     writer: &mut SerialWriter,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
@@ -570,8 +562,8 @@ fn recover_pairing(
     writer: &mut SerialWriter,
     r1_prefix: usize,
     r2_prefix: usize,
-    mut r1_stats: Option<&mut FastqStats>,
-    mut r2_stats: Option<&mut FastqStats>,
+    mut r1_stats: Option<&mut MateQcStats>,
+    mut r2_stats: Option<&mut MateQcStats>,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
     let mut r1_queue = VecDeque::from([first_r1]);
@@ -711,8 +703,8 @@ fn run_paired(
     r2_path: &Path,
     routing: &RoutingTree,
     writer: &mut SerialWriter,
-    mut r1_stats: Option<&mut FastqStats>,
-    mut r2_stats: Option<&mut FastqStats>,
+    mut r1_stats: Option<&mut MateQcStats>,
+    mut r2_stats: Option<&mut MateQcStats>,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
     let mut r1_reader = InputReader::try_open(r1_path)?;
@@ -868,8 +860,8 @@ pub(crate) fn core_read_id(id: &[u8]) -> &[u8] {
 
 pub(crate) fn write_fastq_stats(
     output_dir: &Path,
-    r1: &FastqStats,
-    r2: Option<&FastqStats>,
+    r1: &MateQcStats,
+    r2: Option<&MateQcStats>,
 ) -> Result<(), String> {
     let path = output_dir.join("fastq_stats.tsv");
 
@@ -886,15 +878,75 @@ pub(crate) fn write_fastq_stats(
         )
     })?;
 
-    write_stats_row(&mut file, "R1", r1)?;
+    write_stats_row(&mut file, "R1", r1.biological())?;
 
     if let Some(r2) = r2 {
-        write_stats_row(&mut file, "R2", r2)?;
+        write_stats_row(&mut file, "R2", r2.biological())?;
     }
 
     file.flush()
         .map_err(|e| format!("Could not flush FASTQ stats: {e}"))?;
 
+    write_barcode_stats(output_dir, r1, r2)
+}
+
+fn write_barcode_stats(
+    output_dir: &Path,
+    r1: &MateQcStats,
+    r2: Option<&MateQcStats>,
+) -> Result<(), String> {
+    let path = output_dir.join("barcode_stats.tsv");
+    let mut file =
+        File::create(&path).map_err(|e| format!("Could not create '{}': {e}", path.display()))?;
+
+    writeln!(
+        file,
+        "Mate\tBarcodeSymbol\tMatePiece\tStartCycle\tEndCycle\tOrientation\tReads\tBases\tMinLength\tMaxLength\tMeanLength\tGCPercent\tNPercent\tMeanQuality\tQ20Percent\tQ30Percent"
+    )
+    .map_err(|e| format!("Could not write barcode stats: {e}"))?;
+
+    write_barcode_stats_rows(&mut file, "R1", r1)?;
+    if let Some(r2) = r2 {
+        write_barcode_stats_rows(&mut file, "R2", r2)?;
+    }
+
+    file.flush()
+        .map_err(|e| format!("Could not flush barcode stats: {e}"))
+}
+
+fn write_barcode_stats_rows(
+    file: &mut File,
+    mate: &str,
+    mate_stats: &MateQcStats,
+) -> Result<(), String> {
+    for segment in mate_stats.barcode_segments() {
+        let orientation = match segment.orientation {
+            Orientation::Forward => "forward",
+            Orientation::ReverseComplement => "reverse-complement",
+        };
+        let stats = &segment.stats;
+        writeln!(
+            file,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.4}\t{:.4}\t{:.2}\t{:.4}\t{:.4}",
+            mate,
+            char::from(segment.symbol),
+            segment.piece,
+            segment.start + 1,
+            segment.end,
+            orientation,
+            stats.reads,
+            stats.bases,
+            stats.min_length.unwrap_or(0),
+            stats.max_length,
+            stats.mean_length(),
+            stats.gc_percent(),
+            stats.n_percent(),
+            stats.mean_quality(),
+            stats.q20_percent(),
+            stats.q30_percent(),
+        )
+        .map_err(|e| format!("Could not write barcode stats: {e}"))?;
+    }
     Ok(())
 }
 

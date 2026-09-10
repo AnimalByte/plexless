@@ -52,7 +52,7 @@ fn compare_outputs(direct: &Path, buffered: &Path, fastq_files: &[&str]) {
             "decompressed output differs for {filename}"
         );
     }
-    for filename in ["sample_metrics.tsv", "fastq_stats.tsv"] {
+    for filename in ["sample_metrics.tsv", "fastq_stats.tsv", "barcode_stats.tsv"] {
         assert_eq!(
             fs::read_to_string(direct.join(filename)).unwrap(),
             fs::read_to_string(buffered.join(filename)).unwrap(),
@@ -235,6 +235,7 @@ fn operational_failures_leave_incomplete_markers_in_every_output_path() {
             assert!(output.join("PLEXLESS_INCOMPLETE").is_file());
             assert!(!output.join("sample_metrics.tsv").exists());
             assert!(!output.join("fastq_stats.tsv").exists());
+            assert!(!output.join("barcode_stats.tsv").exists());
 
             let mut retry_args = args(
                 Some(reads.clone()),

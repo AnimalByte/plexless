@@ -155,6 +155,17 @@ unassigned output is enabled, emitted record counts are reconciled with
 unmatched, ambiguous, unrouted, and orphan counts before `sample_metrics.tsv`
 and the terminal QC summary are written.
 
+With `--fastq-stats`, input records are projected through the compiled read
+layout before aggregation. `fastq_stats.tsv` covers only the biological suffix
+after the complete structured prefix. `barcode_stats.tsv` covers each physical
+barcode segment by mate, symbol, mate-local repeated-piece number, and cycle
+range; technical `T` segments are not included. Barcode observations remain in
+raw sequencer orientation because GC, N, and aggregate quality statistics are
+orientation invariant. Cycle ranges are one-based and inclusive, and symbols
+refer to the read layout rather than decoded whitelist IDs. Collection stays
+in the input producer so assigned, unassigned, and orphan records have
+identical QC semantics in serial, direct, and buffered modes.
+
 The run creates `PLEXLESS_INCOMPLETE` after output setup and never removes it
 through `Drop`. Successful orchestration explicitly removes it only after
 writer finalization, count reconciliation, and flushed statistics and sample

@@ -25,7 +25,7 @@ an established workflow before using it in production or clinical pipelines.
 - Parent-local handling of observed `N` bases
 - Child sequence reuse across independent parent namespaces
 - Structured-prefix trimming for assigned reads
-- Optional unassigned output and raw-input FASTQ statistics
+- Optional unassigned output and separate biological/barcode FASTQ statistics
 - Paired-read ID validation, bounded resynchronization, and orphan handling
 - Bounded multithreaded parsing, demultiplexing, compression, and ordered output
 
@@ -166,13 +166,13 @@ ordering, and file-cache details.
 
 | Flag | Default | Description |
 | --- | ---: | --- |
-| `--fastq-stats` | Off | Write `fastq_stats.tsv` with raw, pre-trimming quality and composition statistics. |
+| `--fastq-stats` | Off | Write biological-read statistics to `fastq_stats.tsv` and physical barcode-region statistics to `barcode_stats.tsv`. |
 | `--write-unassigned` | Off | Write unmatched, ambiguous, unrouted, and orphan reads untrimmed to `unassigned*.fastq.gz`. |
 | `--low-sample-fraction <0-1>` | `0.05` | Mark a populated sample `LOW_REPRESENTATION` below this fraction of the nonzero sample median. `0` disables low-representation classifications; missing-sample warnings remain mandatory. |
 | `-h`, `--help` | — | Print `demux` help and exit. |
 
 Every successful run writes `sample_metrics.tsv`; `--fastq-stats` adds the
-raw-input report. Output filenames and report fields are described in
+biological and barcode reports. Output filenames and report fields are described in
 [Output behavior](#output-behavior).
 
 ### Single-end example
@@ -354,9 +354,25 @@ written untrimmed to corresponding `unassigned*.fastq.gz` files.
 Because those filenames are reserved, a worklist sample that sanitizes to
 `unassigned` is rejected when unassigned output is enabled.
 
-`--fastq-stats` writes `fastq_stats.tsv` from raw input before trimming. It
-includes read/base counts, length statistics, GC and N percentages, mean
-quality, and Q20/Q30 percentages.
+`--fastq-stats` writes two input-level QC reports. `fastq_stats.tsv` summarizes
+only the biological suffix after each mate's complete declared prefix.
+`barcode_stats.tsv` summarizes every physical barcode segment separately and
+identifies its mate, symbol, mate-local repeated-piece number, sequencer cycles,
+and declared orientation. Technical `T` segments are excluded from both
+reports. Both reports include read/base counts, length statistics, GC and N
+percentages, mean quality, and Q20/Q30 percentages.
+
+Statistics cover every parsed input record, regardless of whether it is
+assigned, unmatched, ambiguous, unrouted, or orphaned. A mate without a read
+structure is entirely biological. Barcode statistics use the raw observed
+bases and qualities before mismatch correction or reverse-complement
+normalization; orientation is retained as report metadata. `BarcodeSymbol`
+refers to the read-structure symbol, not a decoded whitelist ID, and each row
+aggregates all input observations. `StartCycle` and `EndCycle` are one-based and
+inclusive. For reads shorter than the declared prefix, available barcode cycles
+are counted and the biological observation has length zero. `Reads` in a
+barcode row is the number of parsed records for that mate, including zero-length
+observations when the record ends before that segment.
 
 Every successful run writes `sample_metrics.tsv`, including all worklist
 samples—even those with zero reads. It reports assigned fragments, mate-level
