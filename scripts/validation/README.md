@@ -99,6 +99,17 @@ The gzip writer also fixes header timestamps, so generated compressed bytes are
 reproducible. Use `--seed` to select another deterministic dataset. Existing
 directories are refused; pass `--replace` only when replacement is intended.
 
+For CRAM writer qualification, `--sample-distribution balanced`, `skewed`, and
+`extreme-skew` generate assigned-read distributions of approximately 25% each,
+60% to one hot sample, and 90% to one hot sample, respectively. The default
+`legacy` value preserves the original fixture exactly. For example:
+
+```bash
+python3 scripts/validation/make_plexless_validation_dataset.py \
+  --profile standard --with-cram --sample-distribution extreme-skew \
+  --outdir "$HOME/plexless_validation_data/standard-cram-extreme-skew"
+```
+
 The original external-source injection workflow remains available:
 
 ```bash

@@ -373,7 +373,7 @@ fn cram_to_cram_preserves_and_transforms_metadata_by_policy() {
             ReadMode::Single,
             OutputFormat::Cram,
         ),
-        4,
+        8,
     )
     .unwrap();
 
@@ -441,7 +441,7 @@ fn paired_cram_rewrites_mate_sequence_and_quality_tags() {
             ReadMode::Paired,
             OutputFormat::Cram,
         ),
-        4,
+        8,
     )
     .unwrap();
     let (_, records) = read_cram(&output.join("sample_1.cram"));
@@ -470,7 +470,7 @@ fn invalid_metadata_rewrite_type_fails_and_retains_incomplete_marker() {
             ReadMode::Single,
             OutputFormat::Cram,
         ),
-        4,
+        8,
     )
     .unwrap_err();
 

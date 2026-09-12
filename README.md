@@ -480,13 +480,15 @@ with 64 descriptors reserved on Linux. Other platforms use the conservative
 
 CRAM input uses rust-htslib/HTSlib background decode workers within the same
 global budget. For FASTQ output, budgets of four or more assign approximately
-one quarter to CRAM decode (capped at eight); for CRAM output, one decoder
-worker is used because the ordered metadata-preserving writer is the measured
-bottleneck. One reader and one output writer are accounted first and the
-remainder goes to Plexless workers. The exact allocation is logged. At a budget
-of one, HTSlib decoding remains serial and the caller thread reads, routes, and
-writes inline. A budget of two uses the bounded staged CRAM pipeline and reports
-its one-thread minimum stage overcommit.
+one quarter to CRAM decode (capped at eight). CRAM output keeps HTSlib decoding
+inline because controlled measurements found that background decoding reduced
+whole-pipeline throughput. At budgets of eight or more, an ordered coordinator
+dispatches to two destination-owner writer threads; each output CRAM belongs to
+exactly one writer for the entire run. Smaller staged budgets use one combined
+order/writer thread. The remaining budget goes to Plexless routing workers and
+the exact allocation is logged. At a budget of one, the caller thread reads,
+routes, and writes inline. A budget of two reports its one-thread minimum stage
+overcommit.
 
 Unlike concatenated gzip, CRAM output is not reopened for append. Plexless
 preflights all possible output writers plus a 64-descriptor reserve before
@@ -495,7 +497,9 @@ within the existing hard limit; if the hard limit is insufficient, it fails
 before processing with exact required/soft/hard values. Normal execution
 explicitly finalizes writers, reconciles successful writes, writes reports,
 and removes `PLEXLESS_INCOMPLETE`; it does not decode all output files again.
-Full rereading and `samtools` checks are qualification operations.
+The per-owner queues hold at most two ordered batch chunks each, so a hot
+destination applies bounded backpressure rather than consuming unbounded
+memory. Full rereading and `samtools` checks are qualification operations.
 
 Parallel stages share one first-error cancellation state. Worker panics are
 caught at batch or chunk boundaries with stage and unit context; cancellation

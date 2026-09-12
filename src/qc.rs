@@ -116,6 +116,43 @@ impl SampleQc {
         Ok(())
     }
 
+    pub(crate) fn merge(&mut self, other: Self) -> Result<(), String> {
+        if self.paired != other.paired || self.metrics.len() != other.metrics.len() {
+            return Err("Cannot merge incompatible sample QC accumulators".into());
+        }
+        for (target, source) in self.metrics.iter_mut().zip(other.metrics) {
+            target.assigned_fragments = target
+                .assigned_fragments
+                .checked_add(source.assigned_fragments)
+                .ok_or("Sample fragment count overflow")?;
+            target.single_records = target
+                .single_records
+                .checked_add(source.single_records)
+                .ok_or("Sample record count overflow")?;
+            target.r1_records = target
+                .r1_records
+                .checked_add(source.r1_records)
+                .ok_or("Sample R1 count overflow")?;
+            target.r2_records = target
+                .r2_records
+                .checked_add(source.r2_records)
+                .ok_or("Sample R2 count overflow")?;
+            target.assigned_bases_single = target
+                .assigned_bases_single
+                .checked_add(source.assigned_bases_single)
+                .ok_or("Sample base count overflow")?;
+            target.assigned_bases_r1 = target
+                .assigned_bases_r1
+                .checked_add(source.assigned_bases_r1)
+                .ok_or("Sample R1 base count overflow")?;
+            target.assigned_bases_r2 = target
+                .assigned_bases_r2
+                .checked_add(source.assigned_bases_r2)
+                .ok_or("Sample R2 base count overflow")?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn verify(&self, global_assigned: u64) -> Result<(), String> {
         let sample_total = self.metrics.iter().try_fold(0u64, |total, sample| {
             total

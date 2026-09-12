@@ -16,7 +16,9 @@ use flate2::write::GzEncoder;
 
 use crate::barcodes::BarcodeCatalog;
 use crate::cli::{DemuxArgs, OutputFormat, ReadMode};
-use crate::cram::{CramInputItem, CramOutputItem, CramOwnedRecord, CramWriterManager};
+use crate::cram::{
+    CramInputItem, CramOutputItem, CramOwnedRecord, CramWriterManager, output_target_shard,
+};
 use crate::demux::{DemuxCounts, core_read_id, print_summary, write_fastq_stats};
 use crate::input::{InputFiles, InputSource};
 use crate::output::{
@@ -773,10 +775,11 @@ fn report_cram_thread_allocation(thread_plan: ThreadPlan, output_format: OutputF
         OutputFormat::Cram => "cram",
     };
     eprintln!(
-        "CRAM thread allocation: budget={} reader=1 htslib-decode={} plexless-workers={} {}-writer={} overcommit={}",
+        "CRAM thread allocation: budget={} reader=1 htslib-decode={} plexless-workers={} order-coordinator={} {}-writer={} overcommit={}",
         thread_plan.requested_threads,
         thread_plan.cram_decode_threads,
         thread_plan.initial_worker_threads,
+        thread_plan.cram_order_threads,
         writer_format,
         thread_plan.output_writer_threads,
         thread_plan.budget_overcommit,
@@ -1210,7 +1213,14 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
         if input.output_format() == OutputFormat::Fastq {
             report_output_mode(args.output_mode, output_mode, expected_streams);
         } else {
-            eprintln!("Output format: CRAM (one ordered writer thread)");
+            if thread_plan.requested_threads == 1 {
+                eprintln!("Output format: CRAM (inline ordered writer)");
+            } else {
+                eprintln!(
+                    "Output format: CRAM ({} destination-owner writer thread(s))",
+                    thread_plan.output_writer_threads
+                );
+            }
         }
         report_cram_thread_allocation(thread_plan, input.output_format());
     }
@@ -1830,13 +1840,14 @@ fn run_cram_output_parallel(
     };
     let header = crate::cram::inspect(path, mode)?;
     let output_dir = args.output.clone();
-    let writer = CramWriterManager::new(
+    let mut writers = CramWriterManager::new_shards(
         args.output.clone(),
         &samples,
         header,
         args.write_unassigned,
         args.max_open_files,
         args.compression_level,
+        thread_plan.output_writer_threads,
     )?;
     let run_marker = OutputRunMarker::begin(&output_dir)?;
     let worker_threads = thread_plan.initial_worker_threads;
@@ -1863,9 +1874,25 @@ fn run_cram_output_parallel(
         stage_boundary(&control, "CRAM pipeline coordinator", || {
             let writer_control = control.clone();
             let writer_handle = scope.spawn(move || {
-                stage_boundary(&writer_control, "CRAM output writer thread", || {
-                    cram_writer_loop(writer, &result_rx, sample_count, paired, &writer_control)
-                })
+                if writers.len() == 1 {
+                    let writer = writers
+                        .pop()
+                        .ok_or_else(|| writer_control.fail("Missing CRAM writer manager"))?;
+                    stage_boundary(&writer_control, "CRAM output writer thread", || {
+                        cram_writer_loop(writer, &result_rx, sample_count, paired, &writer_control)
+                    })
+                } else {
+                    stage_boundary(&writer_control, "CRAM output order coordinator", || {
+                        cram_sharded_writer_loop(
+                            writers,
+                            &result_rx,
+                            sample_count,
+                            paired,
+                            args.write_unassigned,
+                            &writer_control,
+                        )
+                    })
+                }
             });
 
             let mut worker_handles = Vec::with_capacity(worker_headroom);
@@ -1998,6 +2025,27 @@ struct CramAggregationResult {
     counts: DemuxCounts,
     sample_qc: SampleQc,
     batches: u64,
+    unassigned_records: u64,
+    metadata: crate::cram::MetadataStats,
+    records: u64,
+    output_bytes: u64,
+    writer_finalization_time: Duration,
+}
+
+#[derive(Debug)]
+struct CramDispatchResult {
+    counts: DemuxCounts,
+    batches: u64,
+}
+
+struct CramWriteChunk {
+    dispatch_id: u64,
+    outputs: Vec<CramOutputItem>,
+    _permit: Arc<PermitGuard>,
+}
+
+struct CramWriterShardResult {
+    sample_qc: SampleQc,
     unassigned_records: u64,
     metadata: crate::cram::MetadataStats,
     records: u64,
@@ -2145,6 +2193,240 @@ fn cram_writer_loop(
         counts,
         sample_qc,
         batches: next_batch_id,
+        unassigned_records,
+        metadata,
+        records,
+        output_bytes,
+        writer_finalization_time,
+    })
+}
+
+fn cram_sharded_writer_loop(
+    writers: Vec<CramWriterManager>,
+    receiver: &Receiver<CramProcessedBatch>,
+    sample_count: usize,
+    paired: bool,
+    write_unassigned: bool,
+    control: &PipelineControl,
+) -> Result<CramAggregationResult, String> {
+    let writer_count = writers.len();
+    if writer_count < 2 {
+        return Err("Sharded CRAM output requires at least two writer threads".into());
+    }
+
+    thread::scope(|scope| {
+        let mut senders = Vec::with_capacity(writer_count);
+        let mut handles = Vec::with_capacity(writer_count);
+        for (shard_index, writer) in writers.into_iter().enumerate() {
+            let (sender, shard_receiver) = bounded::<CramWriteChunk>(QUEUE_DEPTH_PER_WORKER);
+            senders.push(sender);
+            let shard_control = control.clone();
+            handles.push(scope.spawn(move || {
+                stage_boundary(
+                    &shard_control,
+                    &format!("CRAM output writer shard {shard_index}"),
+                    || {
+                        cram_writer_shard_loop(
+                            shard_index,
+                            writer,
+                            &shard_receiver,
+                            sample_count,
+                            paired,
+                            &shard_control,
+                        )
+                    },
+                )
+            }));
+        }
+
+        let dispatch_result = stage_boundary(control, "CRAM ordered shard dispatch", || {
+            cram_dispatch_loop(
+                receiver,
+                senders,
+                sample_count,
+                write_unassigned,
+                writer_count,
+                control,
+            )
+        });
+
+        let mut shard_results = Vec::with_capacity(handles.len());
+        for (shard_index, handle) in handles.into_iter().enumerate() {
+            shard_results.push(match handle.join() {
+                Ok(result) => result,
+                Err(payload) => Err(control.fail(format!(
+                    "CRAM writer shard {shard_index} panicked: {}",
+                    panic_payload(payload)
+                ))),
+            });
+        }
+        if let Some(error) = control.first_error() {
+            return Err(error);
+        }
+        let dispatch = dispatch_result?;
+        let mut sample_qc = SampleQc::new(sample_count, paired);
+        let mut unassigned_records = 0u64;
+        let mut metadata = crate::cram::MetadataStats::default();
+        let mut records = 0u64;
+        let mut output_bytes = 0u64;
+        let mut writer_finalization_time = Duration::ZERO;
+        for result in shard_results {
+            let result = result?;
+            sample_qc.merge(result.sample_qc)?;
+            unassigned_records = unassigned_records
+                .checked_add(result.unassigned_records)
+                .ok_or("Unassigned CRAM record count overflow")?;
+            metadata.merge(result.metadata)?;
+            records = records
+                .checked_add(result.records)
+                .ok_or("CRAM output record count overflow")?;
+            output_bytes = output_bytes
+                .checked_add(result.output_bytes)
+                .ok_or("CRAM output size overflow")?;
+            writer_finalization_time =
+                writer_finalization_time.max(result.writer_finalization_time);
+        }
+
+        Ok(CramAggregationResult {
+            counts: dispatch.counts,
+            sample_qc,
+            batches: dispatch.batches,
+            unassigned_records,
+            metadata,
+            records,
+            output_bytes,
+            writer_finalization_time,
+        })
+    })
+}
+
+fn cram_dispatch_loop(
+    receiver: &Receiver<CramProcessedBatch>,
+    senders: Vec<Sender<CramWriteChunk>>,
+    sample_count: usize,
+    write_unassigned: bool,
+    writer_count: usize,
+    control: &PipelineControl,
+) -> Result<CramDispatchResult, String> {
+    let mut pending = BTreeMap::<u64, CramProcessedBatch>::new();
+    let mut next_batch_id = 0u64;
+    let mut next_dispatch_id = 0u64;
+    let mut counts = DemuxCounts::default();
+    while let Some(batch) = recv_or_cancel(receiver, control)? {
+        if batch.id < next_batch_id || pending.insert(batch.id, batch).is_some() {
+            return Err("Duplicate or stale CRAM batch ID".into());
+        }
+        while let Some(batch) = pending.remove(&next_batch_id) {
+            let CramProcessedBatch {
+                outputs,
+                counts: batch_counts,
+                permit,
+                ..
+            } = batch;
+            let permit = Arc::new(permit);
+            let mut shard_outputs = (0..writer_count).map(|_| Vec::new()).collect::<Vec<_>>();
+            for item in outputs {
+                let shard = output_target_shard(
+                    item.target(),
+                    sample_count,
+                    write_unassigned,
+                    writer_count,
+                )?;
+                shard_outputs[shard].push(item);
+            }
+            for (shard_index, outputs) in shard_outputs.into_iter().enumerate() {
+                if outputs.is_empty() {
+                    continue;
+                }
+                let chunk = CramWriteChunk {
+                    dispatch_id: next_dispatch_id,
+                    outputs,
+                    _permit: Arc::clone(&permit),
+                };
+                send_or_cancel(
+                    &senders[shard_index],
+                    chunk,
+                    control,
+                    "CRAM writer-shard queue disconnected",
+                )?;
+                next_dispatch_id = next_dispatch_id
+                    .checked_add(1)
+                    .ok_or("CRAM writer dispatch ID overflow")?;
+            }
+            drop(permit);
+            counts.merge(&batch_counts);
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or("CRAM batch ID overflow")?;
+        }
+    }
+    if !pending.is_empty() {
+        return Err(format!(
+            "CRAM output ended with a missing batch before batch {next_batch_id}"
+        ));
+    }
+    drop(senders);
+    Ok(CramDispatchResult {
+        counts,
+        batches: next_batch_id,
+    })
+}
+
+fn cram_writer_shard_loop(
+    shard_index: usize,
+    mut writer: CramWriterManager,
+    receiver: &Receiver<CramWriteChunk>,
+    sample_count: usize,
+    paired: bool,
+    control: &PipelineControl,
+) -> Result<CramWriterShardResult, String> {
+    let mut sample_qc = SampleQc::new(sample_count, paired);
+    let mut unassigned_records = 0u64;
+    let mut accounted_records = 0u64;
+    let writing_result = (|| {
+        while let Some(chunk) = recv_or_cancel(receiver, control)? {
+            stage_boundary(
+                control,
+                &format!(
+                    "CRAM writer shard {shard_index} while processing dispatch {}",
+                    chunk.dispatch_id
+                ),
+                || {
+                    inject_test_failure("cram-writer-shard", chunk.dispatch_id)?;
+                    for item in chunk.outputs {
+                        let observation = describe_cram_output(&item)?;
+                        writer.write(item)?;
+                        accounted_records = accounted_records
+                            .checked_add(
+                                u64::try_from(observation.records.len())
+                                    .map_err(|_| "CRAM output record count overflow")?,
+                            )
+                            .ok_or("CRAM output record count overflow")?;
+                        observe_cram_output(observation, &mut sample_qc, &mut unassigned_records)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    })();
+
+    let finish_result = writer.finish();
+    if let Err(error) = writing_result {
+        if let Err(close_error) = finish_result {
+            eprintln!("CRAM writer shard {shard_index} also failed finalization: {close_error}");
+        }
+        return Err(error);
+    }
+    let (metadata, records, output_bytes, writer_finalization_time) =
+        finish_result.map_err(|error| control.fail(error))?;
+    if records != accounted_records {
+        return Err(control.fail(format!(
+            "CRAM writer shard {shard_index} reconciliation failed: {records} successful record writes but {accounted_records} accounted output records"
+        )));
+    }
+    Ok(CramWriterShardResult {
+        sample_qc,
         unassigned_records,
         metadata,
         records,
@@ -3717,6 +3999,131 @@ mod tests {
         assert!(unwind.is_err());
         assert_eq!(permits.try_recv(), Ok(()));
         assert!(!control.is_cancelled());
+    }
+
+    fn test_cram_output(sample_id: u32, id: &[u8]) -> CramOutputItem {
+        CramOutputItem::Single {
+            target: OutputTarget::Sample { sample_id },
+            record: CramOwnedRecord {
+                read: OwnedFastqRecord::new(id, b"A", b"I"),
+                source: Box::new(rust_htslib::bam::Record::new()),
+            },
+            trim_start: 0,
+        }
+    }
+
+    fn test_unassigned_cram_output(id: &[u8]) -> CramOutputItem {
+        CramOutputItem::Single {
+            target: OutputTarget::Unassigned,
+            record: CramOwnedRecord {
+                read: OwnedFastqRecord::new(id, b"A", b"I"),
+                source: Box::new(rust_htslib::bam::Record::new()),
+            },
+            trim_start: 0,
+        }
+    }
+
+    fn cram_chunk_ids(receiver: &Receiver<CramWriteChunk>) -> Vec<(u64, Vec<Vec<u8>>)> {
+        receiver
+            .iter()
+            .map(|chunk| {
+                let ids = chunk
+                    .outputs
+                    .iter()
+                    .map(|item| match item {
+                        CramOutputItem::Single { record, .. }
+                        | CramOutputItem::Orphan { record, .. } => record.read.id.clone(),
+                        CramOutputItem::Pair { r1, .. } => r1.read.id.clone(),
+                    })
+                    .collect();
+                (chunk.dispatch_id, ids)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cram_dispatch_restores_batch_order_before_deterministic_sharding() {
+        let control = PipelineControl::new();
+        let (batch_sender, batch_receiver) = bounded(2);
+        let (shard_0_sender, shard_0_receiver) = bounded(2);
+        let (shard_1_sender, shard_1_receiver) = bounded(2);
+        batch_sender
+            .send(CramProcessedBatch {
+                id: 1,
+                outputs: vec![
+                    test_cram_output(1, b"batch1-sample1"),
+                    test_unassigned_cram_output(b"batch1-unassigned"),
+                ],
+                counts: DemuxCounts::default(),
+                permit: PermitGuard::detached("test CRAM batch"),
+            })
+            .unwrap();
+        batch_sender
+            .send(CramProcessedBatch {
+                id: 0,
+                outputs: vec![
+                    test_cram_output(0, b"batch0-sample0-a"),
+                    test_cram_output(1, b"batch0-sample1"),
+                    test_cram_output(0, b"batch0-sample0-b"),
+                ],
+                counts: DemuxCounts::default(),
+                permit: PermitGuard::detached("test CRAM batch"),
+            })
+            .unwrap();
+        drop(batch_sender);
+
+        let result = cram_dispatch_loop(
+            &batch_receiver,
+            vec![shard_0_sender, shard_1_sender],
+            2,
+            true,
+            2,
+            &control,
+        )
+        .unwrap();
+        assert_eq!(result.batches, 2);
+        assert_eq!(
+            cram_chunk_ids(&shard_0_receiver),
+            vec![
+                (
+                    0,
+                    vec![b"batch0-sample0-a".to_vec(), b"batch0-sample0-b".to_vec()]
+                ),
+                (2, vec![b"batch1-unassigned".to_vec()]),
+            ]
+        );
+        assert_eq!(
+            cram_chunk_ids(&shard_1_receiver),
+            vec![
+                (1, vec![b"batch0-sample1".to_vec()]),
+                (3, vec![b"batch1-sample1".to_vec()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn cram_dispatch_channel_failure_cancels_the_pipeline() {
+        let control = PipelineControl::new();
+        let (batch_sender, batch_receiver) = bounded(1);
+        let (shard_sender, shard_receiver) = bounded(1);
+        drop(shard_receiver);
+        batch_sender
+            .send(CramProcessedBatch {
+                id: 0,
+                outputs: vec![test_cram_output(0, b"record")],
+                counts: DemuxCounts::default(),
+                permit: PermitGuard::detached("test CRAM batch"),
+            })
+            .unwrap();
+        drop(batch_sender);
+
+        let error = stage_boundary(&control, "test CRAM dispatch", || {
+            cram_dispatch_loop(&batch_receiver, vec![shard_sender], 1, true, 1, &control)
+        })
+        .unwrap_err();
+        assert!(error.contains("CRAM writer-shard queue disconnected"));
+        assert!(control.is_cancelled());
+        assert_eq!(control.first_error().as_deref(), Some(error.as_str()));
     }
 
     #[test]

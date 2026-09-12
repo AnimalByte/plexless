@@ -13,6 +13,7 @@ pub(crate) struct ThreadPlan {
     pub(crate) adaptive: bool,
     pub(crate) budget_overcommit: usize,
     pub(crate) cram_decode_threads: usize,
+    pub(crate) cram_order_threads: usize,
     pub(crate) output_writer_threads: usize,
 }
 
@@ -97,13 +98,25 @@ impl ThreadPlan {
             adaptive,
             budget_overcommit,
             cram_decode_threads: 0,
+            cram_order_threads: 0,
             output_writer_threads: 0,
         })
     }
 
     pub(crate) fn for_cram(requested_threads: usize, output_is_cram: bool) -> Result<Self, String> {
+        Self::for_cram_with_writer_threads(requested_threads, output_is_cram, None)
+    }
+
+    pub(crate) fn for_cram_with_writer_threads(
+        requested_threads: usize,
+        output_is_cram: bool,
+        writer_override: Option<usize>,
+    ) -> Result<Self, String> {
         if requested_threads == 0 {
             return Err("Thread budget must be greater than 0".into());
+        }
+        if writer_override == Some(0) {
+            return Err("CRAM writer thread count must be greater than zero".into());
         }
 
         if requested_threads == 1 {
@@ -121,25 +134,40 @@ impl ThreadPlan {
                 adaptive: false,
                 budget_overcommit: 0,
                 cram_decode_threads: 0,
+                cram_order_threads: 0,
                 output_writer_threads: 0,
             });
         }
 
-        // Both staged FASTQ and CRAM output paths have one ordered writer
-        // thread. A budget of two has the minimum one-thread overcommit; from
-        // three threads onward all stages fit the global budget exactly.
-        let output_writer_threads = 1;
+        let output_writer_threads = if output_is_cram {
+            writer_override.unwrap_or(if requested_threads >= 8 { 2 } else { 1 })
+        } else {
+            1
+        };
+        let cram_order_threads = usize::from(output_is_cram && output_writer_threads > 1);
+        if output_is_cram && output_writer_threads > 1 {
+            let minimum = 1usize
+                .checked_add(cram_order_threads)
+                .and_then(|value| value.checked_add(output_writer_threads))
+                .and_then(|value| value.checked_add(1))
+                .ok_or("CRAM thread accounting overflow")?;
+            if requested_threads < minimum {
+                return Err(format!(
+                    "CRAM output requires at least {minimum} total threads for {output_writer_threads} writers"
+                ));
+            }
+        }
         let available_after_fixed = requested_threads
             .saturating_sub(1)
+            .saturating_sub(cram_order_threads)
             .saturating_sub(output_writer_threads);
         let requested_decode_threads = if requested_threads < 4 {
             0
         } else if output_is_cram {
-            // The single ordered CRAM writer is the measured bottleneck. One
-            // HTSlib worker overlaps decoding without spending the routing and
-            // metadata budget on decoder workers that did not improve the
-            // complete pipeline.
-            1
+            // Controlled CRAM-output measurements found that an HTSlib decode
+            // worker reduced whole-pipeline throughput. Keep decoding inline
+            // so the global budget is available to routing and output.
+            0
         } else {
             // Whole-pipeline measurements favored roughly one quarter of the
             // global budget for CRAM decoding, with no benefit beyond eight
@@ -154,6 +182,7 @@ impl ThreadPlan {
         let accounted = 1usize
             .checked_add(cram_decode_threads)
             .and_then(|value| value.checked_add(initial_worker_threads))
+            .and_then(|value| value.checked_add(cram_order_threads))
             .and_then(|value| value.checked_add(output_writer_threads))
             .ok_or("CRAM thread accounting overflow")?;
 
@@ -169,6 +198,7 @@ impl ThreadPlan {
             adaptive: false,
             budget_overcommit: accounted.saturating_sub(requested_threads),
             cram_decode_threads,
+            cram_order_threads,
             output_writer_threads,
         })
     }
@@ -366,31 +396,57 @@ mod tests {
     }
 
     #[test]
-    fn cram_output_thread_plan_keeps_one_decode_worker() {
+    fn cram_output_thread_plan_keeps_decode_inline() {
         let expected = [
-            (1, 0, 0, 0),
-            (2, 0, 1, 1),
-            (4, 1, 1, 0),
-            (8, 1, 5, 0),
-            (12, 1, 9, 0),
-            (16, 1, 13, 0),
-            (24, 1, 21, 0),
-            (32, 1, 29, 0),
-            (64, 1, 61, 0),
+            (1, 0, 0, 0, 0, 0),
+            (2, 0, 1, 1, 0, 1),
+            (4, 0, 2, 1, 0, 0),
+            (8, 0, 4, 2, 1, 0),
+            (12, 0, 8, 2, 1, 0),
+            (16, 0, 12, 2, 1, 0),
+            (24, 0, 20, 2, 1, 0),
+            (32, 0, 28, 2, 1, 0),
+            (64, 0, 60, 2, 1, 0),
         ];
-        for (budget, decode, workers, overcommit) in expected {
+        for (budget, decode, workers, writers, order, overcommit) in expected {
             let plan = ThreadPlan::for_cram(budget, true).unwrap();
             assert_eq!(
                 (
                     plan.cram_decode_threads,
                     plan.initial_worker_threads,
                     plan.output_writer_threads,
+                    plan.cram_order_threads,
                     plan.budget_overcommit,
                 ),
-                (decode, workers, usize::from(budget > 1), overcommit),
+                (decode, workers, writers, order, overcommit),
                 "budget {budget}"
             );
         }
+    }
+
+    #[test]
+    fn cram_output_writer_experiment_stays_within_global_budget() {
+        let expected = [(2, 20), (4, 18), (6, 16), (8, 14)];
+        for (writers, routing_workers) in expected {
+            let plan = ThreadPlan::for_cram_with_writer_threads(24, true, Some(writers)).unwrap();
+            assert_eq!(plan.cram_decode_threads, 0);
+            assert_eq!(plan.cram_order_threads, 1);
+            assert_eq!(plan.output_writer_threads, writers);
+            assert_eq!(plan.initial_worker_threads, routing_workers);
+            assert_eq!(plan.budget_overcommit, 0);
+        }
+    }
+
+    #[test]
+    fn cram_output_writer_experiment_rejects_impossible_budget() {
+        assert!(ThreadPlan::for_cram_with_writer_threads(4, true, Some(2)).is_err());
+        assert!(ThreadPlan::for_cram_with_writer_threads(8, true, Some(0)).is_err());
+        assert_eq!(
+            ThreadPlan::for_cram_with_writer_threads(1, true, Some(2))
+                .unwrap()
+                .output_writer_threads,
+            0
+        );
     }
 
     #[test]

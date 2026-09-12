@@ -126,31 +126,30 @@ For CRAM input, `--threads` is the global staged-pipeline budget. Plexless calls
 rust-htslib `Reader::set_threads(N)`; HTSlib defines `N` as extra background
 decoder workers in addition to the calling reader. FASTQ output assigns one
 quarter of budgets of four or more to CRAM decoding, capped at eight decoder
-workers. CRAM output assigns one decoder worker because measurements show its
-single ordered metadata-preserving writer is the bottleneck. One reader and one
-ordered output writer are accounted first; remaining slots become Plexless
-routing/output workers. At `--threads 1`, a dedicated serial path reads,
-routes, and writes inline on the caller thread with no background decoder or
-stage threads. A budget of two uses the staged pipeline with no HTSlib
-background decoder and one reported thread of minimum stage overcommit. Budgets
-of four and above fit exactly. FASTQ input thread planning is unchanged.
+workers. CRAM output uses no HTSlib background decoder: controlled
+whole-pipeline measurements found inline decode faster. Budgets of eight or
+more use one order coordinator and two destination-owner CRAM writers; smaller
+staged budgets use one combined order/writer thread. Every output file is
+permanently owned by one writer, and the bounded owner queues contain at most
+two batch chunks each. There is no public writer-count setting.
 
-| `--threads` | Decode -> FASTQ | Plexless -> FASTQ | Decode -> CRAM | Plexless -> CRAM | Reader + writer | Overcommit |
+| `--threads` | Reader | CRAM decode workers | Plexless routing workers | Order coordinator | CRAM writers | Overcommit |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0 | 0 | 0 | 0 | 1 (inline) | 0 |
-| 2 | 0 | 1 | 0 | 1 | 2 | 1 |
-| 4 | 1 | 1 | 1 | 1 | 2 | 0 |
-| 8 | 2 | 4 | 1 | 5 | 2 | 0 |
-| 12 | 3 | 7 | 1 | 9 | 2 | 0 |
-| 16 | 4 | 10 | 1 | 13 | 2 | 0 |
-| 24 | 6 | 16 | 1 | 21 | 2 | 0 |
-| 32 | 8 | 22 | 1 | 29 | 2 | 0 |
-| 64 | 8 | 54 | 1 | 61 | 2 | 0 |
+| 1 | 1 (inline) | 0 | 0 | 0 | 0 (inline) | 0 |
+| 2 | 1 | 0 | 1 | 0 | 1 | 1 |
+| 4 | 1 | 0 | 2 | 0 | 1 | 0 |
+| 8 | 1 | 0 | 4 | 1 | 2 | 0 |
+| 12 | 1 | 0 | 8 | 1 | 2 | 0 |
+| 16 | 1 | 0 | 12 | 1 | 2 | 0 |
+| 24 | 1 | 0 | 20 | 1 | 2 | 0 |
+| 32 | 1 | 0 | 28 | 1 | 2 | 0 |
+| 64 | 1 | 0 | 60 | 1 | 2 | 0 |
 
-Per-output CRAM writers remain single-threaded. rust-htslib exposes a shared
-HTSlib thread-pool API, but attaching private pools to hundreds of writers would
-violate the global budget, and writer-side threading was not needed to fix the
-measured decoder starvation. Packed-base shortcuts remain deferred.
+Each CRAM writer remains internally single-threaded; no private HTSlib output
+thread pools are created. Two writers improved balanced one-million-event
+throughput, while six and eight lost performance. The advantage narrows when
+80-90% of assigned reads target one sample because that hot file must remain
+single-owner. Packed-base shortcuts remain deferred.
 
 ## Validation and known limitations
 
@@ -164,7 +163,7 @@ provides a separate reference-free CRAM integrity check.
 
 Current limitations are intentional: no aligned input/output, no FASTQ to
 CRAM conversion, no missing qualities, no coordinate-sorted mate collation,
-no CRAM index, one ordered CRAM output writer stage, linear memory/descriptor
-growth with output count, and removal rather than coordinate rewriting for
-complex base-modification tags. A two-thread CRAM request retains the
-one-thread staged-pipeline minimum overcommit described above.
+no CRAM index, linear memory/descriptor growth with output count, and removal
+rather than coordinate rewriting for complex base-modification tags. A
+two-thread CRAM request retains the one-thread staged-pipeline minimum
+overcommit described above.

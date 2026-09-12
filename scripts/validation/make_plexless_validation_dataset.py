@@ -22,6 +22,7 @@ from typing import IO, Iterator
 
 
 PROFILE_SIZES = {"tiny": 4_096, "standard": 1_000_000, "stress": 10_000_000}
+SAMPLE_DISTRIBUTIONS = ("legacy", "balanced", "skewed", "extreme-skew")
 DEFAULT_OUTDIR = Path.home() / "plexless_validation_data" / "plexless_validation"
 TRUTH_HEADER = (
     "OutputFile\tOutputIndex\tOrdinal\tReadID\tMate\tCase\tCategory\t"
@@ -89,6 +90,15 @@ def parse_args() -> argparse.Namespace:
         help="records/pairs in each focused semantic fixture (default: 4096)",
     )
     parser.add_argument("--seed", type=int, default=20_250_524)
+    parser.add_argument(
+        "--sample-distribution",
+        choices=SAMPLE_DISTRIBUTIONS,
+        default="legacy",
+        help=(
+            "core assigned-read distribution; legacy preserves the original "
+            "fixture, while the other choices support CRAM writer benchmarks"
+        ),
+    )
     parser.add_argument("--r1", type=Path)
     parser.add_argument("--r2", type=Path)
     parser.add_argument(
@@ -317,8 +327,26 @@ def write_expected(
             handle.write(f"{sample}\t{count}\n")
 
 
-def observed_core_barcodes(index: int, case: str) -> tuple[str, str, str]:
-    sample, a_id, b_id = CORE_SAMPLES[index % len(CORE_SAMPLES)]
+def distribution_sample_index(ordinal: int, distribution: str) -> int:
+    if distribution == "legacy":
+        return ordinal % len(CORE_SAMPLES)
+    if distribution == "balanced":
+        return ordinal % len(CORE_SAMPLES)
+    if distribution == "skewed":
+        position = ordinal % 10
+        return 0 if position < 6 else 1 + ((position - 6) % 3)
+    if distribution == "extreme-skew":
+        return 0 if ordinal % 10 < 9 else 1 + ((ordinal // 10) % 3)
+    raise ValueError(f"unknown sample distribution: {distribution}")
+
+
+def observed_core_barcodes(
+    index: int, case: str, distribution: str, assigned_ordinal: int
+) -> tuple[str, str, str]:
+    selection_ordinal = index if distribution == "legacy" else assigned_ordinal
+    sample, a_id, b_id = CORE_SAMPLES[
+        distribution_sample_index(selection_ordinal, distribution)
+    ]
     a = lookup(CORE_A, a_id)
     b = lookup(CORE_B, b_id)
     if case == "mismatch_1":
@@ -368,6 +396,7 @@ def generate_core(
     level: int,
     source_r1: Path | None,
     source_r2: Path | None,
+    sample_distribution: str,
 ) -> dict[str, object]:
     fixture_dir.mkdir(parents=True)
     write_catalog(fixture_dir, {"A": CORE_A, "B": CORE_B}, CORE_SAMPLES)
@@ -395,6 +424,8 @@ def generate_core(
     ):
         maximum = max(records, pairs)
         produced = 0
+        se_assigned_ordinal = 0
+        pe_assigned_ordinal = 0
         for index in range(maximum):
             if source_iterators is None:
                 bio1, qual1 = synthetic_biology(index, 1, seed)
@@ -413,12 +444,15 @@ def generate_core(
                         f"source pair {index + 1} differs: {raw1[0]!r} vs {raw2[0]!r}"
                     )
             case = CORE_CASES[index % len(CORE_CASES)]
-            a, b, sample = observed_core_barcodes(index, case)
 
             if index < records:
                 se_case = "exact" if case.startswith("orphan_") else case
-                if se_case != case:
-                    a, b, sample = observed_core_barcodes(index, se_case)
+                se_is_assigned = se_case in ("exact", "mismatch_1", "observed_n")
+                a, b, sample = observed_core_barcodes(
+                    index, se_case, sample_distribution, se_assigned_ordinal
+                )
+                if se_is_assigned:
+                    se_assigned_ordinal += 1
                 if se_case == "short":
                     se_record = (raw1[0], "ACG", raw1[2], "III")
                     category = "unmatched"
@@ -432,7 +466,7 @@ def generate_core(
                         raw1[2],
                         "I" * len(prefix) + raw1[3],
                     )
-                    if se_case in ("exact", "mismatch_1", "observed_n"):
+                    if se_is_assigned:
                         category = "assigned"
                         expected = (raw1[0], raw1[1], "+", raw1[3])
                         se_samples[sample] += 1
@@ -458,7 +492,12 @@ def generate_core(
                 )
 
             if index < pairs:
-                a, b, sample = observed_core_barcodes(index, case)
+                pe_is_assigned = case in ("exact", "mismatch_1", "observed_n")
+                a, b, sample = observed_core_barcodes(
+                    index, case, sample_distribution, pe_assigned_ordinal
+                )
+                if pe_is_assigned:
+                    pe_assigned_ordinal += 1
                 r1_prefix = a[:3] + b[:3] + "GG"
                 r2_prefix = reverse_complement(a[3:]) + reverse_complement(b[3:]) + "CC"
                 input_r1 = (
@@ -565,12 +604,14 @@ def generate_core(
             "records": records,
             "structure": CORE_SE_STRUCTURE,
             "max_mismatches": 1,
+            "sample_distribution": sample_distribution,
         },
         "pe": {
             "events": pairs,
             "r1_structure": CORE_PE_R1_STRUCTURE,
             "r2_structure": CORE_PE_R2_STRUCTURE,
             "max_mismatches": 1,
+            "sample_distribution": sample_distribution,
         },
     }
 
@@ -753,6 +794,7 @@ def write_manifest(
     seed: int,
     source_mode: bool,
     with_cram: bool,
+    sample_distribution: str,
     fixtures: list[dict[str, object]],
 ) -> None:
     manifest = {
@@ -760,6 +802,7 @@ def write_manifest(
         "profile": profile,
         "seed": seed,
         "source_mode": "injected" if source_mode else "synthetic",
+        "sample_distribution": sample_distribution,
         "cram_fixtures": with_cram,
         "core_records": records,
         "core_pair_events": pairs,
@@ -853,6 +896,7 @@ def main() -> None:
                 args.gzip_level,
                 args.r1,
                 args.r2,
+                args.sample_distribution,
             )
         ]
         focused_count = min(args.special_records, max(records, pairs))
@@ -883,6 +927,7 @@ def main() -> None:
             args.seed,
             source_mode,
             args.with_cram,
+            args.sample_distribution,
             fixtures,
         )
     except Exception:

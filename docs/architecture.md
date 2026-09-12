@@ -151,7 +151,8 @@ preflights the destination count plus a 64-descriptor reserve. Unix builds
 raise a low soft `RLIMIT_NOFILE` only within the existing hard limit and fail
 before output creation when the hard limit is insufficient. Open HTSlib CRAM
 writers also have linear memory cost; measured peak RSS was about 152/291/575
-MiB at 384/750/1,500 active output files on the qualification host.
+MiB with one writer owner and 164/311/615 MiB with two writer owners at
+384/750/1,500 active output files on the qualification host.
 
 Direct mode does not allocate persistent accumulators or separate compression
 queues. Its work/result queues and end-to-end batch credits remain bounded, and
@@ -171,12 +172,14 @@ compression rather than splitting it into two stages.
 CRAM thread planning is isolated from FASTQ planning. rust-htslib
 `Reader::set_threads(N)` supplies `N` additional HTSlib decoder workers. For
 CRAM-to-FASTQ, one quarter of budgets of four or more is assigned to decode,
-capped at eight. CRAM-to-CRAM uses one decoder worker because its single
-ordered writer is the measured limiter. One reader and one output writer are
-accounted before allocating the remaining Plexless workers. `--threads 1`
-instead reads, routes, and writes inline on the caller thread. Budgets of four
-or more stay within the request; the two-thread staged minimum overcommit is
-logged explicitly, with no HTSlib background decoding at that budget.
+capped at eight. CRAM-to-CRAM keeps decode inline, restores global batch order,
+then deterministically maps each destination to one permanent writer owner.
+Budgets of eight or more use two writers plus one order coordinator; lower
+staged budgets combine ordering and writing on one thread. Each owner queue is
+bounded to two batch chunks, and a shared batch permit is released only after
+all shard chunks are consumed. `--threads 1` instead reads, routes, and writes
+inline on the caller thread. Budgets of four or more stay within the request;
+the two-thread staged minimum overcommit is logged explicitly.
 
 ## Completion and QC invariants
 

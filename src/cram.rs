@@ -438,6 +438,14 @@ impl MetadataStats {
         Ok(())
     }
 
+    pub(crate) fn merge(&mut self, other: Self) -> Result<(), String> {
+        for (key, value) in other.counts {
+            let count = self.counts.entry(key).or_default();
+            *count = count.checked_add(value).ok_or("Metadata count overflow")?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_report(&self, output_dir: &Path) -> Result<(), String> {
         let mut report = String::from("Action\tTag\tCount\n");
         for ((action, tag), count) in &self.counts {
@@ -687,6 +695,9 @@ pub(crate) struct CramWriterManager {
     compression_level: u32,
     metadata: MetadataStats,
     records_written: u64,
+    sample_count: usize,
+    shard_index: usize,
+    shard_count: usize,
 }
 
 impl CramWriterManager {
@@ -699,6 +710,32 @@ impl CramWriterManager {
         max_open_files: Option<usize>,
         compression_level: u32,
     ) -> Result<Self, String> {
+        Self::new_shards(
+            output_dir,
+            samples,
+            header,
+            write_unassigned,
+            max_open_files,
+            compression_level,
+            1,
+        )?
+        .pop()
+        .ok_or_else(|| "Internal error: CRAM writer setup created no writer".into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_shards(
+        output_dir: PathBuf,
+        samples: &SampleSheet,
+        header: CramHeader,
+        write_unassigned: bool,
+        max_open_files: Option<usize>,
+        compression_level: u32,
+        shard_count: usize,
+    ) -> Result<Vec<Self>, String> {
+        if shard_count == 0 {
+            return Err("CRAM writer shard count must be greater than zero".into());
+        }
         let target_count = samples
             .samples
             .len()
@@ -707,21 +744,34 @@ impl CramWriterManager {
         let sample_names = build_sample_names(samples, write_unassigned)?;
         preflight_cram_descriptors(target_count, max_open_files)?;
         prepare_output_dir(&output_dir)?;
-        Ok(Self {
-            output_dir,
-            sample_names,
-            header: header.header,
-            writers: HashMap::new(),
-            output_paths: HashMap::new(),
-            write_unassigned,
-            compression_level,
-            metadata: MetadataStats::default(),
-            records_written: 0,
-        })
+        let sample_count = samples.samples.len();
+        Ok((0..shard_count)
+            .map(|shard_index| Self {
+                output_dir: output_dir.clone(),
+                sample_names: sample_names.clone(),
+                header: header.header.clone(),
+                writers: HashMap::new(),
+                output_paths: HashMap::new(),
+                write_unassigned,
+                compression_level,
+                metadata: MetadataStats::default(),
+                records_written: 0,
+                sample_count,
+                shard_index,
+                shard_count,
+            })
+            .collect())
     }
 
     pub(crate) fn write(&mut self, item: CramOutputItem) -> Result<(), String> {
         let target = item.target();
+        validate_output_target_owner(
+            target,
+            self.sample_count,
+            self.write_unassigned,
+            self.shard_count,
+            self.shard_index,
+        )?;
         match item {
             CramOutputItem::Single {
                 mut record,
@@ -840,6 +890,45 @@ impl CramWriterManager {
         self.writers.insert(target, writer);
         Ok(())
     }
+}
+
+pub(crate) fn output_target_shard(
+    target: OutputTarget,
+    sample_count: usize,
+    write_unassigned: bool,
+    shard_count: usize,
+) -> Result<usize, String> {
+    if shard_count == 0 {
+        return Err("CRAM writer shard count must be greater than zero".into());
+    }
+    let target_index = match target {
+        OutputTarget::Sample { sample_id } => {
+            let index = usize::try_from(sample_id).map_err(|_| "Invalid sample ID")?;
+            if index >= sample_count {
+                return Err(format!("Unknown sample ID {sample_id}"));
+            }
+            index
+        }
+        OutputTarget::Unassigned if write_unassigned => sample_count,
+        OutputTarget::Unassigned => return Err("Unassigned output is disabled".into()),
+    };
+    Ok(target_index % shard_count)
+}
+
+fn validate_output_target_owner(
+    target: OutputTarget,
+    sample_count: usize,
+    write_unassigned: bool,
+    shard_count: usize,
+    shard_index: usize,
+) -> Result<(), String> {
+    let owner = output_target_shard(target, sample_count, write_unassigned, shard_count)?;
+    if owner != shard_index {
+        return Err(format!(
+            "CRAM destination owner violation: target {target:?} belongs to writer shard {owner}, not {shard_index}"
+        ));
+    }
+    Ok(())
 }
 
 // Policy for an assigned record whose prefix is trimmed:
@@ -1000,6 +1089,44 @@ fn remove_if_present(record: &mut bam::Record, tag: &[u8; 2]) -> Result<bool, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cram_output_targets_have_one_stable_writer_owner() {
+        let owners = (0..6)
+            .map(|sample_id| {
+                output_target_shard(OutputTarget::Sample { sample_id }, 6, true, 4).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(owners, vec![0, 1, 2, 3, 0, 1]);
+        assert_eq!(
+            output_target_shard(OutputTarget::Unassigned, 6, true, 4).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn cram_output_target_owner_rejects_invalid_destinations() {
+        assert!(output_target_shard(OutputTarget::Sample { sample_id: 2 }, 2, true, 2).is_err());
+        assert!(output_target_shard(OutputTarget::Unassigned, 2, false, 2).is_err());
+        assert!(output_target_shard(OutputTarget::Sample { sample_id: 0 }, 2, true, 0).is_err());
+    }
+
+    #[test]
+    fn exactly_one_writer_accepts_each_cram_destination() {
+        for target in [
+            OutputTarget::Sample { sample_id: 0 },
+            OutputTarget::Sample { sample_id: 1 },
+            OutputTarget::Sample { sample_id: 2 },
+            OutputTarget::Unassigned,
+        ] {
+            let accepted = (0..3)
+                .filter(|shard_index| {
+                    validate_output_target_owner(target, 3, true, 3, *shard_index).is_ok()
+                })
+                .count();
+            assert_eq!(accepted, 1, "target {target:?}");
+        }
+    }
 
     #[test]
     fn descriptor_preflight_raises_only_the_soft_limit() {
