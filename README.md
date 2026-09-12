@@ -1,7 +1,7 @@
 # plexless
 
-`plexless` is a high-throughput hierarchical FASTQ demultiplexer for
-single-end and paired-end sequencing data. Read structures describe physical
+`plexless` is a high-throughput hierarchical FASTQ and unmapped-CRAM
+demultiplexer for single-end and paired-end sequencing data. Read structures describe physical
 barcode pieces, while an ordinary tabular sample sheet defines parent-to-child
 barcode namespaces and sample routes.
 
@@ -28,22 +28,23 @@ an established workflow before using it in production or clinical pipelines.
 - Optional unassigned output and separate biological/barcode FASTQ statistics
 - Paired-read ID validation, bounded resynchronization, and orphan handling
 - Bounded multithreaded parsing, demultiplexing, compression, and ordered output
+- Unmapped CRAM input with FASTQ or metadata-preserving unmapped CRAM output
 
 ## Installation
 
-Plexless links against the system zlib library. Installing from crates.io or
-building from source requires a recent stable Rust toolchain, Cargo, and the
-zlib development package:
+Plexless links against the system zlib library. Source builds also compile
+HTSlib for CRAM support and require a C toolchain, `make`, `pkg-config`, Clang,
+and libclang in addition to a recent stable Rust toolchain and Cargo:
 
 ```bash
 # Ubuntu/Debian
-sudo apt install zlib1g-dev
+sudo apt install build-essential clang libclang-dev make pkg-config zlib1g-dev
 
 # Fedora/RHEL
-sudo dnf install zlib-devel
+sudo dnf install clang clang-devel gcc make pkgconf-pkg-config zlib-devel
 
 # Arch Linux
-sudo pacman -S zlib
+sudo pacman -S base-devel clang pkgconf zlib
 ```
 
 ### Install from crates.io
@@ -100,7 +101,7 @@ Plexless has one subcommand, `demux`:
 ```text
 plexless [--threads <N>] demux [OPTIONS] \
   --barcodes <TSV> --samples <TSV> --output <DIR> \
-  <--reads <FASTQ> | --r1 <FASTQ> --r2 <FASTQ>>
+  <--reads <FASTQ> | --r1 <FASTQ> --r2 <FASTQ> | --cram <CRAM>>
 ```
 
 `--threads` is global and may also appear after `demux`. Show the authoritative
@@ -115,7 +116,7 @@ plexless demux --help
 
 | Flag | Default | Description |
 | --- | ---: | --- |
-| `--threads <N>` | `1` | Total CPU-work budget shared by FASTQ parsing, gzip input, routing, and output compression. `1` uses the serial reference pipeline; values must be positive integers. |
+| `--threads <N>` | `1` | Global work budget shared by input decoding, routing, and output. FASTQ `1` uses the serial reference; CRAM uses no HTSlib background workers at `1`. Values must be positive integers. |
 | `-h`, `--help` | — | Print help and exit. |
 
 ### Input and routing options
@@ -125,6 +126,9 @@ plexless demux --help
 | `--reads <FASTQ>` | SE | Single-end FASTQ or FASTQ.gz input. Conflicts with `--r1` and `--r2`. |
 | `--r1 <FASTQ>` | PE | Paired-end R1 FASTQ or FASTQ.gz input. Requires `--r2`. |
 | `--r2 <FASTQ>` | PE | Paired-end R2 FASTQ or FASTQ.gz input. Requires `--r1`. |
+| `--cram <CRAM>` | CRAM | One unmapped CRAM input. Conflicts with all FASTQ inputs. |
+| `--read-mode <single\|paired>` | CRAM | Required declaration of CRAM record interpretation; never inferred. |
+| `--output-format <fastq\|cram>` | CRAM | Required output choice. Existing FASTQ input needs no new option and remains FASTQ output. |
 | `--structure <LAYOUT>` | SE | Single-end read structure, such as `R1_10A11B4T`. |
 | `--r1-structure <LAYOUT>` | PE¹ | R1 read structure, such as `R1_10A11B4T`. |
 | `--r2-structure <LAYOUT>` | PE¹ | R2 read structure, such as `R2_8C`. |
@@ -139,16 +143,21 @@ Exactly one input mode is allowed. Single-end runs require `--reads` and
 `--structure`. Paired-end runs require `--r1`, `--r2`, and at least one of
 `--r1-structure` or `--r2-structure`.
 
+CRAM input requires both `--read-mode` and `--output-format`. Only raw,
+unmapped CRAM is accepted. Paired CRAM must declare queryname ordering/grouping
+in `@HD` with `SO:queryname` or `GO:query`. See the complete
+[CRAM contract](docs/cram.md), including validation and metadata policy.
+
 ### Output and performance options
 
 | Flag | Default | Description |
 | --- | ---: | --- |
 | `-o`, `--output <DIR>` | Required | Output directory. Plexless creates it if absent; an existing directory must be empty. |
-| `--compression-level <0-9>` | `2` | Gzip compression level for output FASTQs. Lower levels generally favor throughput. |
+| `--compression-level <0-9>` | `2` | Compression level for output FASTQ gzip streams or CRAM files. Lower levels generally favor throughput. |
 | `--output-mode <MODE>` | `auto` | `auto`, `direct`, or `buffered`. Auto selects direct below 384 expected streams and buffered at 384 or more. |
 | `--output-chunk-size <SIZE>` | `auto` | Buffered-mode target for uncompressed bytes per gzip member. Explicit values must be 32 KiB–64 MiB and no larger than the buffer budget. |
 | `--output-buffer-memory <SIZE>` | `auto` | Buffered-mode memory budget for active output accumulators. Explicit values must be at least 1 MiB and no more than half of currently available memory. |
-| `--max-open-files <N>` | adaptive | Positive override for the bounded output-file cache. It cannot exceed Plexless's safe process limit. |
+| `--max-open-files <N>` | adaptive | FASTQ: positive override for the bounded writer cache. CRAM: must be at least the simultaneous destination count; CRAM writers cannot be reopened for append. |
 
 `SIZE` is a positive integer followed optionally by `B`, `K`/`KB`/`KiB`,
 `M`/`MB`/`MiB`, or `G`/`GB`/`GiB`; suffixes are case-insensitive and use
@@ -205,6 +214,34 @@ plexless --threads 16 demux \
 
 Quote structures containing `(rc)` so shells do not interpret the
 parentheses.
+
+### Unmapped CRAM examples
+
+Single-end CRAM to FASTQ requires an explicit lossy format choice:
+
+```bash
+plexless --threads 8 demux \
+  --cram reads.cram --read-mode single --output-format fastq \
+  --structure R1_10A11B4T \
+  --barcodes barcodes.tsv --samples samples.tsv \
+  --output demux_fastq --write-unassigned
+```
+
+Plexless reports that SAM/CRAM metadata not representable in FASTQ will not be
+present in this output. It does not encode arbitrary tags in FASTQ headers.
+
+Paired, queryname-grouped CRAM to metadata-preserving CRAM:
+
+```bash
+plexless --threads 16 demux \
+  --cram paired.queryname.cram --read-mode paired --output-format cram \
+  --r1-structure R1_10A11B4T \
+  --r2-structure 'R2_10A(rc)11B(rc)' \
+  --barcodes barcodes.tsv --samples samples.tsv \
+  --output demux_cram --write-unassigned
+```
+
+FASTQ to CRAM and aligned CRAM input/output are not supported.
 
 ### Explicit output tuning
 
@@ -348,6 +385,11 @@ candidate-path rescue is not currently performed.
 Assigned single-end reads are written as `<sample>.fastq.gz`. Paired output is
 written as `<sample>_R1.fastq.gz` and `<sample>_R2.fastq.gz`.
 
+For CRAM output, each sample is one `<sample>.cram`; paired mates remain in the
+same file. Enabled unassigned output is `unassigned.cram`. The preserved input
+header gains one uniquely named Plexless `@PG` entry. No CRAM index is created.
+See [CRAM metadata preservation](docs/cram.md#metadata-preservation-policy).
+
 Assigned reads have their declared structured prefixes removed independently
 from each mate. With `--write-unassigned`, unassigned and orphan records are
 written untrimmed to corresponding `unassigned*.fastq.gz` files.
@@ -436,6 +478,25 @@ most 256 files by default, further limited by the process file-descriptor limit
 with 64 descriptors reserved on Linux. Other platforms use the conservative
 256-file cap. Evicted outputs are safely reopened for append.
 
+CRAM input uses rust-htslib/HTSlib background decode workers within the same
+global budget. For FASTQ output, budgets of four or more assign approximately
+one quarter to CRAM decode (capped at eight); for CRAM output, one decoder
+worker is used because the ordered metadata-preserving writer is the measured
+bottleneck. One reader and one output writer are accounted first and the
+remainder goes to Plexless workers. The exact allocation is logged. At a budget
+of one, HTSlib decoding remains serial and the caller thread reads, routes, and
+writes inline. A budget of two uses the bounded staged CRAM pipeline and reports
+its one-thread minimum stage overcommit.
+
+Unlike concatenated gzip, CRAM output is not reopened for append. Plexless
+preflights all possible output writers plus a 64-descriptor reserve before
+creating the output directory. On Unix it raises a low soft `RLIMIT_NOFILE`
+within the existing hard limit; if the hard limit is insufficient, it fails
+before processing with exact required/soft/hard values. Normal execution
+explicitly finalizes writers, reconciles successful writes, writes reports,
+and removes `PLEXLESS_INCOMPLETE`; it does not decode all output files again.
+Full rereading and `samtools` checks are qualification operations.
+
 Parallel stages share one first-error cancellation state. Worker panics are
 caught at batch or chunk boundaries with stage and unit context; cancellation
 wakes bounded channel operations and adaptive worker gates. In-flight batch
@@ -455,6 +516,9 @@ original failure instead of reporting a disconnected queue or normal success.
 - Automatic output buffer budget: 25% of available memory, capped at 2 GiB
 - Automatic output mode: direct below 384 streams; buffered at 384 or more
 - Automatic output writer cache: expected streams, capped at 256 and the safe descriptor limit
+- CRAM input: unmapped records only; missing sequence or quality is rejected
+- Paired CRAM: authoritative queryname grouping and at most one primary R1/R2 per QNAME
+- CRAM output: all potentially populated files remain open; descriptor limits are preflighted and writer memory scales approximately linearly with output count
 
 Startup validation covers read-structure and `(rc)` syntax, required barcode
 sets, barcode bases and logical lengths, duplicate IDs and complete paths,
@@ -466,6 +530,8 @@ limit. Short reads are safely classified as unmatched.
 
 - [`docs/architecture.md`](docs/architecture.md) documents compilation and the
   allocation-free read hot path.
+- [`docs/cram.md`](docs/cram.md) documents the supported CRAM matrix, validation,
+  metadata transformation contract, and limitations.
 - [`tests/hierarchical_routing.rs`](tests/hierarchical_routing.rs) covers local
   namespaces, dense-grid selection, correction safety, reuse, and generic symbols.
 - [`tests/scalable_output_qc.rs`](tests/scalable_output_qc.rs) covers high

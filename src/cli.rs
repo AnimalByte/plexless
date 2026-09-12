@@ -3,6 +3,18 @@ use std::path::PathBuf;
 
 pub use crate::output::OutputMode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReadMode {
+    Single,
+    Paired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    Fastq,
+    Cram,
+}
+
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -74,7 +86,7 @@ fn parse_byte_size(value: &str) -> Result<ByteSizeSetting, String> {
 
 #[derive(Parser, Debug)]
 #[command(name = "plexless")]
-#[command(about = "FASTQ nested demultiplexing tool")]
+#[command(about = "FASTQ and unmapped CRAM nested demultiplexing tool")]
 pub struct Cli {
     /// Total CPU-work budget. plexless accounts for FASTQ parsing and
     /// dynamically shares remaining capacity between gzip decompression and
@@ -103,7 +115,7 @@ pub enum Command {
         ArgGroup::new("input")
             .required(true)
             .multiple(false)
-            .args(["reads", "r1"])
+            .args(["reads", "r1", "cram"])
     )
 )]
 pub struct DemuxArgs {
@@ -119,12 +131,23 @@ pub struct DemuxArgs {
     #[arg(long, requires = "r1")]
     pub r2: Option<PathBuf>,
 
+    /// Unmapped CRAM input (requires --read-mode and --output-format)
+    #[arg(long, conflicts_with_all = ["reads", "r1", "r2"])]
+    pub cram: Option<PathBuf>,
+
+    /// Record interpretation for CRAM input; never inferred from records
+    #[arg(long, value_enum, requires = "cram")]
+    pub read_mode: Option<ReadMode>,
+
+    /// Output format for CRAM input; FASTQ input retains its existing output
+    #[arg(long, value_enum, requires = "cram")]
+    pub output_format: Option<OutputFormat>,
+
     /// Read structure for single-end input
     ///
     /// Example: `R1_10A11B4T`
     #[arg(
         long,
-        requires = "reads",
         conflicts_with_all = ["r1_structure", "r2_structure"]
     )]
     pub structure: Option<String>,
@@ -132,13 +155,13 @@ pub struct DemuxArgs {
     /// R1 read structure for paired-end input
     ///
     /// Example: `R1_10A11B4T`
-    #[arg(long, requires = "r1", conflicts_with = "structure")]
+    #[arg(long, conflicts_with = "structure")]
     pub r1_structure: Option<String>,
 
     /// R2 read structure for paired-end input
     ///
     /// Example: `R2_8C`
-    #[arg(long, requires = "r2", conflicts_with = "structure")]
+    #[arg(long, conflicts_with = "structure")]
     pub r2_structure: Option<String>,
 
     /// Barcode whitelist/catalog TSV
@@ -178,7 +201,7 @@ pub struct DemuxArgs {
     #[arg(long, default_value = "auto", value_parser = parse_byte_size)]
     pub output_buffer_memory: ByteSizeSetting,
 
-    /// Maximum simultaneously open output files (adaptive by default)
+    /// FASTQ writer-cache limit; CRAM simultaneous-writer minimum (adaptive by default)
     #[arg(long, value_parser = parse_positive_usize)]
     pub max_open_files: Option<usize>,
 
@@ -201,14 +224,36 @@ pub struct DemuxArgs {
 
 impl DemuxArgs {
     pub fn validate(&self) -> Result<(), String> {
-        if self.reads.is_some() && self.structure.is_none() {
-            return Err("Single-end input requires --structure".into());
-        }
+        if self.cram.is_some() {
+            let mode = self
+                .read_mode
+                .ok_or("CRAM input requires --read-mode single or --read-mode paired")?;
+            self.output_format
+                .ok_or("CRAM input requires --output-format fastq or --output-format cram")?;
+            match mode {
+                ReadMode::Single if self.structure.is_none() => {
+                    return Err("Single-end CRAM input requires --structure".into());
+                }
+                ReadMode::Paired if self.r1_structure.is_none() && self.r2_structure.is_none() => {
+                    return Err("Paired-end CRAM input requires at least one of \
+                         --r1-structure or --r2-structure"
+                        .into());
+                }
+                _ => {}
+            }
+        } else {
+            if self.read_mode.is_some() || self.output_format.is_some() {
+                return Err("--read-mode and --output-format are only valid with --cram; FASTQ to CRAM is not supported".into());
+            }
+            if self.reads.is_some() && self.structure.is_none() {
+                return Err("Single-end input requires --structure".into());
+            }
 
-        if self.r1.is_some() && self.r1_structure.is_none() && self.r2_structure.is_none() {
-            return Err("Paired-end input requires at least one of \
-                 --r1-structure or --r2-structure"
-                .into());
+            if self.r1.is_some() && self.r1_structure.is_none() && self.r2_structure.is_none() {
+                return Err("Paired-end input requires at least one of \
+                     --r1-structure or --r2-structure"
+                    .into());
+            }
         }
 
         Ok(())
@@ -243,5 +288,91 @@ mod tests {
         assert_eq!(parse_fraction("0.05"), Ok(0.05));
         assert!(parse_fraction("-0.1").is_err());
         assert!(parse_fraction("1.1").is_err());
+    }
+
+    fn demux_from(arguments: &[&str]) -> DemuxArgs {
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        match cli.command {
+            Command::Demux(args) => args,
+        }
+    }
+
+    #[test]
+    fn fastq_cli_does_not_require_new_cram_options() {
+        let args = demux_from(&[
+            "plexless",
+            "demux",
+            "--reads",
+            "reads.fastq.gz",
+            "--structure",
+            "R1_4A",
+            "--barcodes",
+            "barcodes.tsv",
+            "--samples",
+            "samples.tsv",
+            "--output",
+            "out",
+        ]);
+        assert_eq!(args.output_format, None);
+        assert_eq!(args.read_mode, None);
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn cram_cli_requires_explicit_mode_and_output_format() {
+        let args = demux_from(&[
+            "plexless",
+            "demux",
+            "--cram",
+            "reads.cram",
+            "--structure",
+            "R1_4A",
+            "--barcodes",
+            "barcodes.tsv",
+            "--samples",
+            "samples.tsv",
+            "--output",
+            "out",
+        ]);
+        assert!(args.validate().unwrap_err().contains("--read-mode"));
+
+        let args = demux_from(&[
+            "plexless",
+            "demux",
+            "--cram",
+            "reads.cram",
+            "--read-mode",
+            "single",
+            "--structure",
+            "R1_4A",
+            "--barcodes",
+            "barcodes.tsv",
+            "--samples",
+            "samples.tsv",
+            "--output",
+            "out",
+        ]);
+        assert!(args.validate().unwrap_err().contains("--output-format"));
+    }
+
+    #[test]
+    fn output_format_cannot_enable_fastq_to_cram() {
+        let args = demux_from(&[
+            "plexless",
+            "demux",
+            "--reads",
+            "reads.fastq.gz",
+            "--structure",
+            "R1_4A",
+            "--output-format",
+            "cram",
+            "--barcodes",
+            "barcodes.tsv",
+            "--samples",
+            "samples.tsv",
+            "--output",
+            "out",
+        ]);
+        assert!(args.validate().unwrap_err().contains("FASTQ to CRAM"));
     }
 }

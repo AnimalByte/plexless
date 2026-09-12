@@ -12,6 +12,8 @@ pub(crate) struct ThreadPlan {
     pub(crate) parallel_gzip: bool,
     pub(crate) adaptive: bool,
     pub(crate) budget_overcommit: usize,
+    pub(crate) cram_decode_threads: usize,
+    pub(crate) output_writer_threads: usize,
 }
 
 impl ThreadPlan {
@@ -20,11 +22,26 @@ impl ThreadPlan {
         paired: bool,
         has_gzip: bool,
     ) -> Result<Self, String> {
+        Self::with_parser_threads(
+            requested_threads,
+            if paired { 2 } else { 1 },
+            paired,
+            has_gzip,
+        )
+    }
+
+    pub(crate) fn with_parser_threads(
+        requested_threads: usize,
+        parser_threads: usize,
+        paired: bool,
+        has_gzip: bool,
+    ) -> Result<Self, String> {
         if requested_threads == 0 {
             return Err("Thread budget must be greater than 0".into());
         }
-
-        let parser_threads = if paired { 2 } else { 1 };
+        if parser_threads == 0 {
+            return Err("Parser thread count must be greater than 0".into());
+        }
 
         let shared_slots = requested_threads.saturating_sub(parser_threads).max(1);
         let budget_overcommit = parser_threads
@@ -79,6 +96,80 @@ impl ThreadPlan {
             parallel_gzip,
             adaptive,
             budget_overcommit,
+            cram_decode_threads: 0,
+            output_writer_threads: 0,
+        })
+    }
+
+    pub(crate) fn for_cram(requested_threads: usize, output_is_cram: bool) -> Result<Self, String> {
+        if requested_threads == 0 {
+            return Err("Thread budget must be greater than 0".into());
+        }
+
+        if requested_threads == 1 {
+            // CRAM has a dedicated inline path at this budget: the caller's
+            // thread reads, routes, and writes each item without stage threads.
+            return Ok(Self {
+                requested_threads,
+                parser_threads: 1,
+                shared_slots: 0,
+                initial_input_threads: 0,
+                initial_worker_threads: 0,
+                max_input_threads: 0,
+                worker_headroom: 0,
+                parallel_gzip: false,
+                adaptive: false,
+                budget_overcommit: 0,
+                cram_decode_threads: 0,
+                output_writer_threads: 0,
+            });
+        }
+
+        // Both staged FASTQ and CRAM output paths have one ordered writer
+        // thread. A budget of two has the minimum one-thread overcommit; from
+        // three threads onward all stages fit the global budget exactly.
+        let output_writer_threads = 1;
+        let available_after_fixed = requested_threads
+            .saturating_sub(1)
+            .saturating_sub(output_writer_threads);
+        let requested_decode_threads = if requested_threads < 4 {
+            0
+        } else if output_is_cram {
+            // The single ordered CRAM writer is the measured bottleneck. One
+            // HTSlib worker overlaps decoding without spending the routing and
+            // metadata budget on decoder workers that did not improve the
+            // complete pipeline.
+            1
+        } else {
+            // Whole-pipeline measurements favored roughly one quarter of the
+            // global budget for CRAM decoding, with no benefit beyond eight
+            // workers on a 24-thread qualification host.
+            (requested_threads / 4).min(8)
+        };
+        let cram_decode_threads =
+            requested_decode_threads.min(available_after_fixed.saturating_sub(1));
+        let initial_worker_threads = available_after_fixed
+            .saturating_sub(cram_decode_threads)
+            .max(1);
+        let accounted = 1usize
+            .checked_add(cram_decode_threads)
+            .and_then(|value| value.checked_add(initial_worker_threads))
+            .and_then(|value| value.checked_add(output_writer_threads))
+            .ok_or("CRAM thread accounting overflow")?;
+
+        Ok(Self {
+            requested_threads,
+            parser_threads: 1,
+            shared_slots: initial_worker_threads,
+            initial_input_threads: 0,
+            initial_worker_threads,
+            max_input_threads: 0,
+            worker_headroom: initial_worker_threads,
+            parallel_gzip: false,
+            adaptive: false,
+            budget_overcommit: accounted.saturating_sub(requested_threads),
+            cram_decode_threads,
+            output_writer_threads,
         })
     }
 
@@ -244,6 +335,62 @@ mod tests {
         );
         assert!(!se.parallel_gzip);
         assert!(!pe.parallel_gzip);
+    }
+
+    #[test]
+    fn cram_fastq_thread_plan_uses_bounded_quarter_for_decode() {
+        let expected = [
+            (1, 0, 0, 0),
+            (2, 0, 1, 1),
+            (4, 1, 1, 0),
+            (8, 2, 4, 0),
+            (12, 3, 7, 0),
+            (16, 4, 10, 0),
+            (24, 6, 16, 0),
+            (32, 8, 22, 0),
+            (64, 8, 54, 0),
+        ];
+        for (budget, decode, workers, overcommit) in expected {
+            let plan = ThreadPlan::for_cram(budget, false).unwrap();
+            assert_eq!(
+                (
+                    plan.cram_decode_threads,
+                    plan.initial_worker_threads,
+                    plan.output_writer_threads,
+                    plan.budget_overcommit,
+                ),
+                (decode, workers, usize::from(budget > 1), overcommit),
+                "budget {budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn cram_output_thread_plan_keeps_one_decode_worker() {
+        let expected = [
+            (1, 0, 0, 0),
+            (2, 0, 1, 1),
+            (4, 1, 1, 0),
+            (8, 1, 5, 0),
+            (12, 1, 9, 0),
+            (16, 1, 13, 0),
+            (24, 1, 21, 0),
+            (32, 1, 29, 0),
+            (64, 1, 61, 0),
+        ];
+        for (budget, decode, workers, overcommit) in expected {
+            let plan = ThreadPlan::for_cram(budget, true).unwrap();
+            assert_eq!(
+                (
+                    plan.cram_decode_threads,
+                    plan.initial_worker_threads,
+                    plan.output_writer_threads,
+                    plan.budget_overcommit,
+                ),
+                (decode, workers, usize::from(budget > 1), overcommit),
+                "budget {budget}"
+            );
+        }
     }
 
     #[test]

@@ -627,7 +627,7 @@ impl CompressedWriterManager {
     }
 }
 
-fn build_sample_names(
+pub(crate) fn build_sample_names(
     samples: &SampleSheet,
     write_unassigned: bool,
 ) -> Result<Vec<String>, String> {
@@ -772,7 +772,7 @@ fn write_fastq_record(
     Ok(())
 }
 
-fn prepare_output_dir(path: &Path) -> Result<(), String> {
+pub(crate) fn prepare_output_dir(path: &Path) -> Result<(), String> {
     if path.exists() {
         if !path.is_dir() {
             return Err(format!(

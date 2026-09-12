@@ -2,12 +2,45 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::cli::DemuxArgs;
+use crate::cli::{DemuxArgs, OutputFormat, ReadMode};
 
 #[derive(Debug)]
 pub(crate) enum InputFiles {
     Single(PathBuf),
     Paired { r1: PathBuf, r2: PathBuf },
+}
+
+#[derive(Debug)]
+pub(crate) enum InputSource {
+    Fastq(InputFiles),
+    Cram {
+        path: PathBuf,
+        mode: ReadMode,
+        output_format: OutputFormat,
+    },
+}
+
+impl InputSource {
+    pub(crate) fn is_paired(&self) -> bool {
+        match self {
+            Self::Fastq(files) => files.is_paired(),
+            Self::Cram { mode, .. } => *mode == ReadMode::Paired,
+        }
+    }
+
+    pub(crate) fn output_format(&self) -> OutputFormat {
+        match self {
+            Self::Fastq(_) => OutputFormat::Fastq,
+            Self::Cram { output_format, .. } => *output_format,
+        }
+    }
+
+    pub(crate) fn has_gzip(&self) -> Result<bool, String> {
+        match self {
+            Self::Fastq(files) => files.has_gzip(),
+            Self::Cram { .. } => Ok(false),
+        }
+    }
 }
 
 impl InputFiles {
@@ -40,6 +73,22 @@ pub(crate) fn resolve_inputs(args: &DemuxArgs) -> Result<InputFiles, String> {
         validate_input_path(reads)?;
         Ok(InputFiles::Single(reads.to_path_buf()))
     }
+}
+
+pub(crate) fn resolve_input_source(args: &DemuxArgs) -> Result<InputSource, String> {
+    if let Some(path) = args.cram.as_deref() {
+        validate_input_path(path)?;
+        return Ok(InputSource::Cram {
+            path: path.to_path_buf(),
+            mode: args
+                .read_mode
+                .ok_or("CRAM input requires --read-mode single or paired")?,
+            output_format: args
+                .output_format
+                .ok_or("CRAM input requires --output-format fastq or cram")?,
+        });
+    }
+    resolve_inputs(args).map(InputSource::Fastq)
 }
 
 fn validate_input_path(path: &Path) -> Result<(), String> {

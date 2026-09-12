@@ -1,5 +1,6 @@
 pub mod barcodes;
 pub mod cli;
+pub(crate) mod cram;
 pub mod decoder;
 pub mod demux;
 pub mod encoder;

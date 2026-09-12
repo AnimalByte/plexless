@@ -8,15 +8,17 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
 use crate::barcodes::BarcodeCatalog;
-use crate::cli::DemuxArgs;
+use crate::cli::{DemuxArgs, OutputFormat, ReadMode};
+use crate::cram::{CramInputItem, CramOutputItem, CramOwnedRecord, CramWriterManager};
 use crate::demux::{DemuxCounts, core_read_id, print_summary, write_fastq_stats};
-use crate::input::InputFiles;
+use crate::input::{InputFiles, InputSource};
 use crate::output::{
     CompressionJob, OutputAccumulator, OutputKey, OutputLayout, OutputMate, OutputTarget,
     ResolvedOutputMode, available_memory_bytes, calculate_output_buffer_policy, report_output_mode,
@@ -29,7 +31,10 @@ use crate::samples::SampleSheet;
 use crate::stats::MateQcStats;
 use crate::structure::ReadLayout;
 use crate::thread_plan::{AdaptiveAllocation, AllocationSnapshot, ThreadPlan};
-use crate::writer::{CompressedWriterManager, OutputRunMarker, resolve_max_open_files};
+use crate::writer::{
+    CompressedWriterManager, DirectWriterManager, OutputRunMarker, WriterCompletion, WriterManager,
+    resolve_max_open_files,
+};
 
 const PAIRED_RESYNC_WINDOW: usize = 1024;
 const PAIRED_READER_QUEUE: usize = 256;
@@ -343,14 +348,14 @@ struct SharedState {
 }
 
 #[derive(Debug)]
-struct OwnedFastqRecord {
-    id: Vec<u8>,
-    seq: Vec<u8>,
-    qual: Vec<u8>,
+pub(crate) struct OwnedFastqRecord {
+    pub(crate) id: Vec<u8>,
+    pub(crate) seq: Vec<u8>,
+    pub(crate) qual: Vec<u8>,
 }
 
 impl OwnedFastqRecord {
-    fn new(id: &[u8], seq: &[u8], qual: &[u8]) -> Self {
+    pub(crate) fn new(id: &[u8], seq: &[u8], qual: &[u8]) -> Self {
         Self {
             id: id.to_vec(),
             seq: seq.to_vec(),
@@ -369,6 +374,16 @@ enum WorkItem {
     Orphan {
         mate: OutputMate,
         record: OwnedFastqRecord,
+    },
+    CramSingle(CramOwnedRecord),
+    CramPair {
+        r1: CramOwnedRecord,
+        r2: CramOwnedRecord,
+        r1_first: bool,
+    },
+    CramOrphan {
+        mate: OutputMate,
+        record: CramOwnedRecord,
     },
 }
 
@@ -391,6 +406,14 @@ struct BufferedOutput {
 struct ProcessedBatch {
     id: u64,
     outputs: Vec<BufferedOutput>,
+    counts: DemuxCounts,
+    permit: PermitGuard,
+}
+
+#[derive(Debug)]
+struct CramProcessedBatch {
+    id: u64,
+    outputs: Vec<CramOutputItem>,
     counts: DemuxCounts,
     permit: PermitGuard,
 }
@@ -738,6 +761,337 @@ fn report_thread_allocation(thread_plan: ThreadPlan, output_mode: ResolvedOutput
     }
 }
 
+fn report_cram_thread_allocation(thread_plan: ThreadPlan, output_format: OutputFormat) {
+    if thread_plan.requested_threads == 1 {
+        eprintln!(
+            "CRAM thread allocation: budget=1 inline-reader-routing-writer=1 htslib-decode=0 overcommit=0"
+        );
+        return;
+    }
+    let writer_format = match output_format {
+        OutputFormat::Fastq => "fastq",
+        OutputFormat::Cram => "cram",
+    };
+    eprintln!(
+        "CRAM thread allocation: budget={} reader=1 htslib-decode={} plexless-workers={} {}-writer={} overcommit={}",
+        thread_plan.requested_threads,
+        thread_plan.cram_decode_threads,
+        thread_plan.initial_worker_threads,
+        writer_format,
+        thread_plan.output_writer_threads,
+        thread_plan.budget_overcommit,
+    );
+}
+
+enum CramSerialFastqWriter {
+    Direct(DirectWriterManager),
+    Buffered(WriterManager),
+}
+
+impl CramSerialFastqWriter {
+    fn write(
+        &mut self,
+        target: OutputTarget,
+        mate: OutputMate,
+        record: &OwnedFastqRecord,
+        trim_start: usize,
+    ) -> Result<(), String> {
+        let seq = record
+            .seq
+            .get(trim_start..)
+            .ok_or("Internal error: CRAM FASTQ trim exceeds sequence length")?;
+        let qual = record
+            .qual
+            .get(trim_start..)
+            .ok_or("Internal error: CRAM FASTQ trim exceeds quality length")?;
+        match (self, target) {
+            (Self::Direct(writer), OutputTarget::Sample { sample_id }) => {
+                writer.write_sample(sample_id, mate, &record.id, seq, qual)
+            }
+            (Self::Buffered(writer), OutputTarget::Sample { sample_id }) => {
+                writer.write_sample(sample_id, mate, &record.id, seq, qual)
+            }
+            (Self::Direct(writer), OutputTarget::Unassigned) => {
+                writer.write_unassigned(mate, &record.id, seq, qual)
+            }
+            (Self::Buffered(writer), OutputTarget::Unassigned) => {
+                writer.write_unassigned(mate, &record.id, seq, qual)
+            }
+        }
+    }
+
+    fn finish(self) -> Result<WriterCompletion, String> {
+        match self {
+            Self::Direct(writer) => writer.finish_with_qc(),
+            Self::Buffered(writer) => writer.finish_with_qc(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cram_fastq_serial(
+    args: DemuxArgs,
+    path: &Path,
+    mode: ReadMode,
+    paired: bool,
+    state: SharedState,
+    samples: SampleSheet,
+    output_mode: ResolvedOutputMode,
+    max_open_files: usize,
+    mut r1_stats: Option<MateQcStats>,
+    mut r2_stats: Option<MateQcStats>,
+) -> Result<(), String> {
+    let output_dir = args.output.clone();
+    let mut writer = match output_mode {
+        ResolvedOutputMode::Direct => {
+            eprintln!("Output writers: max-open-files={max_open_files}");
+            CramSerialFastqWriter::Direct(DirectWriterManager::new(
+                args.output,
+                &samples,
+                paired,
+                args.write_unassigned,
+                max_open_files,
+                args.compression_level,
+            )?)
+        }
+        ResolvedOutputMode::Buffered => {
+            let output_policy = calculate_output_buffer_policy(
+                state.output_layout.stream_count()?,
+                available_memory_bytes().unwrap_or(512 * 1024 * 1024),
+                args.output_chunk_size.explicit_bytes(),
+                args.output_buffer_memory.explicit_bytes(),
+            )?;
+            eprintln!(
+                "Output buffering: streams={} chunk={} bytes budget={} bytes max-open-files={}",
+                output_policy.expected_streams,
+                output_policy.chunk_size,
+                output_policy.memory_budget,
+                max_open_files,
+            );
+            CramSerialFastqWriter::Buffered(WriterManager::new_with_policy(
+                args.output,
+                &samples,
+                paired,
+                args.write_unassigned,
+                max_open_files,
+                args.compression_level,
+                output_policy.chunk_size,
+                output_policy.memory_budget,
+            )?)
+        }
+    };
+    let run_marker = OutputRunMarker::begin(&output_dir)?;
+    let mut counts = DemuxCounts::default();
+
+    crate::cram::read_items(path, mode, 0, |item| match item {
+        CramInputItem::Single(record) => {
+            if let Some(stats) = r1_stats.as_mut() {
+                stats.update(&record.read.seq, &record.read.qual)?;
+            }
+            let (target, trim_start) = route_single_record(&record.read, &state, &mut counts)?;
+            if should_emit(target, state.write_unassigned) {
+                writer.write(target, OutputMate::Single, &record.read, trim_start)?;
+            }
+            Ok(())
+        }
+        CramInputItem::Pair { r1, r2, .. } => {
+            if let Some(stats) = r1_stats.as_mut() {
+                stats.update(&r1.read.seq, &r1.read.qual)?;
+            }
+            if let Some(stats) = r2_stats.as_mut() {
+                stats.update(&r2.read.seq, &r2.read.qual)?;
+            }
+            let (target, r1_trim, r2_trim) =
+                route_pair_records(&r1.read, &r2.read, &state, &mut counts)?;
+            if should_emit(target, state.write_unassigned) {
+                writer.write(target, OutputMate::R1, &r1.read, r1_trim)?;
+                writer.write(target, OutputMate::R2, &r2.read, r2_trim)?;
+            }
+            Ok(())
+        }
+        CramInputItem::Orphan { mate, record } => {
+            match mate {
+                OutputMate::R1 => {
+                    counts.orphan_r1 += 1;
+                    if let Some(stats) = r1_stats.as_mut() {
+                        stats.update(&record.read.seq, &record.read.qual)?;
+                    }
+                }
+                OutputMate::R2 => {
+                    counts.orphan_r2 += 1;
+                    if let Some(stats) = r2_stats.as_mut() {
+                        stats.update(&record.read.seq, &record.read.qual)?;
+                    }
+                }
+                OutputMate::Single => {
+                    return Err("Internal error: CRAM orphan cannot be single-end".into());
+                }
+            }
+            if state.write_unassigned {
+                writer.write(OutputTarget::Unassigned, mate, &record.read, 0)?;
+            }
+            Ok(())
+        }
+    })?;
+
+    let completion = writer.finish()?;
+    completion.sample_qc.verify(counts.assigned)?;
+    verify_unassigned_output_counts(
+        &counts,
+        paired,
+        args.write_unassigned,
+        completion.unassigned_records,
+    )?;
+    if let Some(r1) = &r1_stats {
+        write_fastq_stats(&output_dir, r1, r2_stats.as_ref())?;
+    }
+    let qc_summary =
+        completion
+            .sample_qc
+            .write_report(&output_dir, &samples, args.low_sample_fraction)?;
+    run_marker.complete()?;
+    print_summary(&counts);
+    print_sample_summary(qc_summary);
+    eprintln!(
+        "  gzip chunks: {} ({:.1} KiB average uncompressed, {} compressed bytes)",
+        completion.chunks,
+        if completion.chunks == 0 {
+            0.0
+        } else {
+            completion.uncompressed_bytes as f64 / completion.chunks as f64 / 1024.0
+        },
+        completion.compressed_bytes,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cram_output_serial(
+    args: DemuxArgs,
+    path: &Path,
+    mode: ReadMode,
+    paired: bool,
+    state: SharedState,
+    samples: SampleSheet,
+    mut r1_stats: Option<MateQcStats>,
+    mut r2_stats: Option<MateQcStats>,
+) -> Result<(), String> {
+    let header = crate::cram::inspect(path, mode)?;
+    let output_dir = args.output.clone();
+    let mut writer = CramWriterManager::new(
+        args.output,
+        &samples,
+        header,
+        args.write_unassigned,
+        args.max_open_files,
+        args.compression_level,
+    )?;
+    let run_marker = OutputRunMarker::begin(&output_dir)?;
+    let mut counts = DemuxCounts::default();
+    let mut sample_qc = SampleQc::new(samples.samples.len(), paired);
+    let mut unassigned_records = 0u64;
+    let mut accounted_records = 0u64;
+
+    crate::cram::read_items(path, mode, 0, |input| {
+        let item = match input {
+            CramInputItem::Single(record) => {
+                if let Some(stats) = r1_stats.as_mut() {
+                    stats.update(&record.read.seq, &record.read.qual)?;
+                }
+                let (target, trim_start) = route_single_record(&record.read, &state, &mut counts)?;
+                should_emit(target, state.write_unassigned).then_some(CramOutputItem::Single {
+                    target,
+                    record,
+                    trim_start,
+                })
+            }
+            CramInputItem::Pair { r1, r2, r1_first } => {
+                if let Some(stats) = r1_stats.as_mut() {
+                    stats.update(&r1.read.seq, &r1.read.qual)?;
+                }
+                if let Some(stats) = r2_stats.as_mut() {
+                    stats.update(&r2.read.seq, &r2.read.qual)?;
+                }
+                let (target, r1_trim, r2_trim) =
+                    route_pair_records(&r1.read, &r2.read, &state, &mut counts)?;
+                should_emit(target, state.write_unassigned).then_some(CramOutputItem::Pair {
+                    target,
+                    r1,
+                    r2,
+                    r1_trim,
+                    r2_trim,
+                    r1_first,
+                })
+            }
+            CramInputItem::Orphan { mate, record } => {
+                match mate {
+                    OutputMate::R1 => {
+                        counts.orphan_r1 += 1;
+                        if let Some(stats) = r1_stats.as_mut() {
+                            stats.update(&record.read.seq, &record.read.qual)?;
+                        }
+                    }
+                    OutputMate::R2 => {
+                        counts.orphan_r2 += 1;
+                        if let Some(stats) = r2_stats.as_mut() {
+                            stats.update(&record.read.seq, &record.read.qual)?;
+                        }
+                    }
+                    OutputMate::Single => {
+                        return Err("Internal error: CRAM orphan cannot be single-end".into());
+                    }
+                }
+                state.write_unassigned.then_some(CramOutputItem::Orphan {
+                    target: OutputTarget::Unassigned,
+                    mate,
+                    record,
+                })
+            }
+        };
+
+        if let Some(item) = item {
+            let observation = describe_cram_output(&item)?;
+            writer.write(item)?;
+            accounted_records = accounted_records
+                .checked_add(
+                    u64::try_from(observation.records.len())
+                        .map_err(|_| "CRAM output record count overflow")?,
+                )
+                .ok_or("CRAM output record count overflow")?;
+            observe_cram_output(observation, &mut sample_qc, &mut unassigned_records)?;
+        }
+        Ok(())
+    })?;
+
+    let (metadata, records, output_bytes, writer_finalization_time) = writer.finish()?;
+    if records != accounted_records {
+        return Err(format!(
+            "CRAM write-path reconciliation failed: {records} successful record writes but {accounted_records} accounted output records"
+        ));
+    }
+    let report_started = Instant::now();
+    sample_qc.verify(counts.assigned)?;
+    verify_unassigned_output_counts(&counts, paired, args.write_unassigned, unassigned_records)?;
+    if let Some(r1) = &r1_stats {
+        write_fastq_stats(&output_dir, r1, r2_stats.as_ref())?;
+    }
+    let qc_summary = sample_qc.write_report(&output_dir, &samples, args.low_sample_fraction)?;
+    metadata.write_report(&output_dir)?;
+    let report_time = report_started.elapsed();
+    run_marker.complete()?;
+    print_summary(&counts);
+    print_sample_summary(qc_summary);
+    eprintln!(
+        "  CRAM records: {records} ({output_bytes} compressed bytes; writers finalized successfully)"
+    );
+    eprintln!(
+        "  CRAM completion phases: writer-finalization={:.3}s reports/reconciliation={:.3}s",
+        writer_finalization_time.as_secs_f64(),
+        report_time.as_secs_f64(),
+    );
+    Ok(())
+}
+
 impl StageGates {
     fn new(total: usize, control: PipelineControl) -> Self {
         let (demux, compression) = split_worker_slots(total);
@@ -817,22 +1171,22 @@ impl AllocationController {
     }
 }
 
-pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result<(), String> {
+pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result<(), String> {
     if threads == 0 {
         return Err("Parallel pipeline requires at least 1 worker thread".into());
     }
 
-    let paired = inputs.is_paired();
-    let has_gzip = inputs.has_gzip()?;
-    let thread_plan = ThreadPlan::new(threads, paired, has_gzip)?;
-    let parallel_input = ParallelInput::new(
-        thread_plan.max_input_threads,
-        thread_plan.initial_input_threads,
-        thread_plan.parallel_gzip,
-    )?;
-    let worker_threads = thread_plan.initial_worker_threads;
-    let worker_headroom = thread_plan.worker_headroom;
-
+    let paired = input.is_paired();
+    let has_gzip = input.has_gzip()?;
+    let thread_plan = match &input {
+        InputSource::Fastq(_) => ThreadPlan::new(threads, paired, has_gzip)?,
+        InputSource::Cram { output_format, .. } => {
+            ThreadPlan::for_cram(threads, *output_format == OutputFormat::Cram)?
+        }
+    };
+    if let InputSource::Cram { path, mode, .. } = &input {
+        crate::cram::inspect(path, *mode)?;
+    }
     let layout = if paired {
         ReadLayout::paired(args.r1_structure.as_deref(), args.r2_structure.as_deref())?
     } else {
@@ -849,9 +1203,22 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
     let output_layout = OutputLayout::new(samples.samples.len(), paired, args.write_unassigned);
     let expected_streams = output_layout.stream_count()?;
     let output_mode = resolve_output_mode(args.output_mode, expected_streams)?;
-    report_output_mode(args.output_mode, output_mode, expected_streams);
-    report_thread_allocation(thread_plan, output_mode);
-    let max_open_files = resolve_max_open_files(expected_streams, args.max_open_files)?;
+    if matches!(input, InputSource::Fastq(_)) {
+        report_output_mode(args.output_mode, output_mode, expected_streams);
+        report_thread_allocation(thread_plan, output_mode);
+    } else {
+        if input.output_format() == OutputFormat::Fastq {
+            report_output_mode(args.output_mode, output_mode, expected_streams);
+        } else {
+            eprintln!("Output format: CRAM (one ordered writer thread)");
+        }
+        report_cram_thread_allocation(thread_plan, input.output_format());
+    }
+    let max_open_files = if input.output_format() == OutputFormat::Fastq {
+        resolve_max_open_files(expected_streams, args.max_open_files)?
+    } else {
+        0
+    };
 
     let state = SharedState {
         routing,
@@ -862,10 +1229,64 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
     };
     let control = PipelineControl::new();
 
+    if matches!(input, InputSource::Cram { .. }) && input.output_format() == OutputFormat::Fastq {
+        eprintln!(
+            "Warning: CRAM input is being written as FASTQ; SAM/CRAM header and record metadata not representable in FASTQ will not be present in the output"
+        );
+    }
+
+    if threads == 1
+        && let InputSource::Cram {
+            path,
+            mode,
+            output_format,
+        } = &input
+    {
+        return match output_format {
+            OutputFormat::Fastq => run_cram_fastq_serial(
+                args,
+                path,
+                *mode,
+                paired,
+                state,
+                samples,
+                output_mode,
+                max_open_files,
+                r1_stats,
+                r2_stats,
+            ),
+            OutputFormat::Cram => run_cram_output_serial(
+                args, path, *mode, paired, state, samples, r1_stats, r2_stats,
+            ),
+        };
+    }
+
+    let parallel_input = ParallelInput::new(
+        thread_plan.max_input_threads,
+        thread_plan.initial_input_threads,
+        thread_plan.parallel_gzip,
+    )?;
+    let worker_threads = thread_plan.initial_worker_threads;
+    let worker_headroom = thread_plan.worker_headroom;
+
+    if input.output_format() == OutputFormat::Cram {
+        return run_cram_output_parallel(
+            args,
+            input,
+            paired,
+            thread_plan,
+            state,
+            samples,
+            control,
+            r1_stats,
+            r2_stats,
+        );
+    }
+
     if output_mode == ResolvedOutputMode::Direct {
         return run_direct_parallel(
             args,
-            inputs,
+            input,
             paired,
             thread_plan,
             parallel_input,
@@ -1043,15 +1464,15 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
                 }
             };
 
-            let producer_result = stage_boundary(&control, "Input producer", || match &inputs {
-                InputFiles::Single(path) => produce_single(
+            let producer_result = stage_boundary(&control, "Input producer", || match &input {
+                InputSource::Fastq(InputFiles::Single(path)) => produce_single(
                     path,
                     &mut batcher,
                     r1_stats.as_mut(),
                     &parallel_input,
                     &control,
                 ),
-                InputFiles::Paired { r1, r2 } => produce_paired(
+                InputSource::Fastq(InputFiles::Paired { r1, r2 }) => produce_paired(
                     r1,
                     r2,
                     &mut batcher,
@@ -1059,6 +1480,15 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
                     r2_stats.as_mut(),
                     &parallel_input,
                     &control,
+                ),
+                InputSource::Cram { path, mode, .. } => produce_cram(
+                    path,
+                    *mode,
+                    thread_plan.cram_decode_threads,
+                    false,
+                    &mut batcher,
+                    r1_stats.as_mut(),
+                    r2_stats.as_mut(),
                 ),
             });
 
@@ -1173,7 +1603,7 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, inputs: InputFiles) -> Result
 #[allow(clippy::too_many_arguments)]
 fn run_direct_parallel(
     args: DemuxArgs,
-    inputs: InputFiles,
+    input: InputSource,
     paired: bool,
     thread_plan: ThreadPlan,
     parallel_input: ParallelInput,
@@ -1272,15 +1702,15 @@ fn run_direct_parallel(
                     BatchSender::new(work_tx, batch_permit_rx, batch_permit_tx, control.clone())
                 }
             };
-            let producer_result = stage_boundary(&control, "Input producer", || match &inputs {
-                InputFiles::Single(path) => produce_single(
+            let producer_result = stage_boundary(&control, "Input producer", || match &input {
+                InputSource::Fastq(InputFiles::Single(path)) => produce_single(
                     path,
                     &mut batcher,
                     r1_stats.as_mut(),
                     &parallel_input,
                     &control,
                 ),
-                InputFiles::Paired { r1, r2 } => produce_paired(
+                InputSource::Fastq(InputFiles::Paired { r1, r2 }) => produce_paired(
                     r1,
                     r2,
                     &mut batcher,
@@ -1288,6 +1718,15 @@ fn run_direct_parallel(
                     r2_stats.as_mut(),
                     &parallel_input,
                     &control,
+                ),
+                InputSource::Cram { path, mode, .. } => produce_cram(
+                    path,
+                    *mode,
+                    thread_plan.cram_decode_threads,
+                    false,
+                    &mut batcher,
+                    r1_stats.as_mut(),
+                    r2_stats.as_mut(),
                 ),
             });
             let batches_sent = match producer_result {
@@ -1368,6 +1807,408 @@ fn run_direct_parallel(
     print_summary(&counts);
     print_sample_summary(qc_summary);
     print_chunk_summary(aggregation.uncompressed_bytes, &writer_result);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cram_output_parallel(
+    args: DemuxArgs,
+    input: InputSource,
+    paired: bool,
+    thread_plan: ThreadPlan,
+    state: SharedState,
+    samples: SampleSheet,
+    control: PipelineControl,
+    mut r1_stats: Option<MateQcStats>,
+    mut r2_stats: Option<MateQcStats>,
+) -> Result<(), String> {
+    let (path, mode) = match &input {
+        InputSource::Cram { path, mode, .. } => (path, *mode),
+        InputSource::Fastq(_) => {
+            return Err("FASTQ to CRAM conversion is not supported".into());
+        }
+    };
+    let header = crate::cram::inspect(path, mode)?;
+    let output_dir = args.output.clone();
+    let writer = CramWriterManager::new(
+        args.output.clone(),
+        &samples,
+        header,
+        args.write_unassigned,
+        args.max_open_files,
+        args.compression_level,
+    )?;
+    let run_marker = OutputRunMarker::begin(&output_dir)?;
+    let worker_threads = thread_plan.initial_worker_threads;
+    let worker_headroom = thread_plan.worker_headroom;
+    let queue_capacity = worker_threads
+        .checked_mul(QUEUE_DEPTH_PER_WORKER)
+        .ok_or("CRAM worker queue capacity overflow")?
+        .clamp(1, MAX_QUEUED_BATCHES);
+    let (work_tx, work_rx) = bounded::<WorkBatch>(queue_capacity);
+    let (result_tx, result_rx) = bounded::<CramProcessedBatch>(queue_capacity);
+    let batch_outstanding_limit = queue_capacity
+        .checked_mul(2)
+        .ok_or("CRAM outstanding batch limit overflow")?;
+    let (batch_permit_tx, batch_permit_rx) = bounded::<()>(batch_outstanding_limit);
+    for _ in 0..batch_outstanding_limit {
+        batch_permit_tx
+            .send(())
+            .map_err(|_| "Could not initialize CRAM batch permits")?;
+    }
+    let worker_gate = WorkerGate::new(worker_threads, control.clone());
+    let sample_count = samples.samples.len();
+
+    let pipeline_result = thread::scope(|scope| {
+        stage_boundary(&control, "CRAM pipeline coordinator", || {
+            let writer_control = control.clone();
+            let writer_handle = scope.spawn(move || {
+                stage_boundary(&writer_control, "CRAM output writer thread", || {
+                    cram_writer_loop(writer, &result_rx, sample_count, paired, &writer_control)
+                })
+            });
+
+            let mut worker_handles = Vec::with_capacity(worker_headroom);
+            for worker_index in 0..worker_headroom {
+                let receiver = work_rx.clone();
+                let sender = result_tx.clone();
+                let worker_state = &state;
+                let gate = worker_gate.clone();
+                let worker_control = control.clone();
+                worker_handles.push(scope.spawn(move || {
+                    stage_boundary(
+                        &worker_control,
+                        &format!("CRAM routing worker {worker_index}"),
+                        || {
+                            cram_worker_loop(
+                                worker_index,
+                                &receiver,
+                                &sender,
+                                worker_state,
+                                gate,
+                                &worker_control,
+                            )
+                        },
+                    )
+                }));
+            }
+            drop(work_rx);
+            drop(result_tx);
+
+            let mut batcher =
+                BatchSender::new(work_tx, batch_permit_rx, batch_permit_tx, control.clone());
+            let producer_result = stage_boundary(&control, "CRAM input producer", || {
+                produce_cram(
+                    path,
+                    mode,
+                    thread_plan.cram_decode_threads,
+                    true,
+                    &mut batcher,
+                    r1_stats.as_mut(),
+                    r2_stats.as_mut(),
+                )
+            });
+            let batches_sent = match producer_result {
+                Ok(()) => stage_boundary(&control, "CRAM input batch finalization", || {
+                    batcher.finish()
+                }),
+                Err(error) => {
+                    drop(batcher);
+                    Err(error)
+                }
+            };
+            let gate_result = if control.is_cancelled() {
+                Err(control.root_error())
+            } else {
+                stage_boundary(&control, "CRAM worker gate finalization", || {
+                    worker_gate.set_limit(worker_headroom)
+                })
+            };
+
+            let mut worker_results = Vec::with_capacity(worker_handles.len());
+            for handle in worker_handles {
+                worker_results.push(match handle.join() {
+                    Ok(result) => result,
+                    Err(payload) => Err(control.fail(format!(
+                        "CRAM worker boundary panicked: {}",
+                        panic_payload(payload)
+                    ))),
+                });
+            }
+            let writer_result = match writer_handle.join() {
+                Ok(result) => result,
+                Err(payload) => Err(control.fail(format!(
+                    "CRAM writer boundary panicked: {}",
+                    panic_payload(payload)
+                ))),
+            };
+            if let Some(error) = control.first_error() {
+                return Err(error);
+            }
+            for result in worker_results {
+                result?;
+            }
+            gate_result?;
+            let aggregation = writer_result?;
+            let expected_batches = batches_sent?;
+            if aggregation.batches != expected_batches {
+                return Err(format!(
+                    "CRAM pipeline lost work: sent {expected_batches} batches but wrote {}",
+                    aggregation.batches
+                ));
+            }
+            Ok(aggregation)
+        })
+    });
+
+    let aggregation = pipeline_result?;
+    let report_started = Instant::now();
+    aggregation.sample_qc.verify(aggregation.counts.assigned)?;
+    verify_unassigned_output_counts(
+        &aggregation.counts,
+        paired,
+        args.write_unassigned,
+        aggregation.unassigned_records,
+    )?;
+    if let Some(r1) = &r1_stats {
+        write_fastq_stats(&output_dir, r1, r2_stats.as_ref())?;
+    }
+    let qc_summary =
+        aggregation
+            .sample_qc
+            .write_report(&output_dir, &samples, args.low_sample_fraction)?;
+    aggregation.metadata.write_report(&output_dir)?;
+    let report_time = report_started.elapsed();
+    run_marker.complete()?;
+    print_summary(&aggregation.counts);
+    print_sample_summary(qc_summary);
+    eprintln!(
+        "  CRAM records: {} ({} compressed bytes; writers finalized successfully)",
+        aggregation.records, aggregation.output_bytes
+    );
+    eprintln!(
+        "  CRAM completion phases: writer-finalization={:.3}s reports/reconciliation={:.3}s",
+        aggregation.writer_finalization_time.as_secs_f64(),
+        report_time.as_secs_f64(),
+    );
+    Ok(())
+}
+
+struct CramAggregationResult {
+    counts: DemuxCounts,
+    sample_qc: SampleQc,
+    batches: u64,
+    unassigned_records: u64,
+    metadata: crate::cram::MetadataStats,
+    records: u64,
+    output_bytes: u64,
+    writer_finalization_time: Duration,
+}
+
+fn cram_worker_loop(
+    worker_index: usize,
+    receiver: &Receiver<WorkBatch>,
+    sender: &Sender<CramProcessedBatch>,
+    state: &SharedState,
+    gate: WorkerGate,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    loop {
+        gate.wait_until_active(worker_index)?;
+        let Some(batch) = recv_or_cancel(receiver, control)? else {
+            return Ok(());
+        };
+        let batch_id = batch.id;
+        let processed = stage_boundary(
+            control,
+            &format!("CRAM routing worker {worker_index} while processing batch {batch_id}"),
+            || process_cram_batch(batch, state),
+        )?;
+        send_or_cancel(
+            sender,
+            processed,
+            control,
+            "CRAM processed-batch queue disconnected",
+        )?;
+    }
+}
+
+fn process_cram_batch(batch: WorkBatch, state: &SharedState) -> Result<CramProcessedBatch, String> {
+    let WorkBatch { id, items, permit } = batch;
+    let mut outputs = Vec::with_capacity(items.len());
+    let mut counts = DemuxCounts::default();
+    for item in items {
+        match item {
+            WorkItem::CramSingle(record) => {
+                let route = route_single_record(&record.read, state, &mut counts)?;
+                if should_emit(route.0, state.write_unassigned) {
+                    outputs.push(CramOutputItem::Single {
+                        target: route.0,
+                        record,
+                        trim_start: route.1,
+                    });
+                }
+            }
+            WorkItem::CramPair { r1, r2, r1_first } => {
+                let (target, r1_trim, r2_trim) =
+                    route_pair_records(&r1.read, &r2.read, state, &mut counts)?;
+                if should_emit(target, state.write_unassigned) {
+                    outputs.push(CramOutputItem::Pair {
+                        target,
+                        r1,
+                        r2,
+                        r1_trim,
+                        r2_trim,
+                        r1_first,
+                    });
+                }
+            }
+            WorkItem::CramOrphan { mate, record } => {
+                match mate {
+                    OutputMate::R1 => counts.orphan_r1 += 1,
+                    OutputMate::R2 => counts.orphan_r2 += 1,
+                    OutputMate::Single => {
+                        return Err(
+                            "Internal error: paired CRAM orphan cannot be single-end".into()
+                        );
+                    }
+                }
+                if state.write_unassigned {
+                    outputs.push(CramOutputItem::Orphan {
+                        target: OutputTarget::Unassigned,
+                        mate,
+                        record,
+                    });
+                }
+            }
+            WorkItem::Single(_) | WorkItem::Pair { .. } | WorkItem::Orphan { .. } => {
+                return Err("Internal error: FASTQ work reached CRAM output adapter".into());
+            }
+        }
+    }
+    Ok(CramProcessedBatch {
+        id,
+        outputs,
+        counts,
+        permit,
+    })
+}
+
+fn cram_writer_loop(
+    mut writer: CramWriterManager,
+    receiver: &Receiver<CramProcessedBatch>,
+    sample_count: usize,
+    paired: bool,
+    control: &PipelineControl,
+) -> Result<CramAggregationResult, String> {
+    let mut pending = BTreeMap::<u64, CramProcessedBatch>::new();
+    let mut next_batch_id = 0u64;
+    let mut counts = DemuxCounts::default();
+    let mut sample_qc = SampleQc::new(sample_count, paired);
+    let mut unassigned_records = 0u64;
+    let mut accounted_records = 0u64;
+    while let Some(batch) = recv_or_cancel(receiver, control)? {
+        if batch.id < next_batch_id || pending.insert(batch.id, batch).is_some() {
+            return Err("Duplicate or stale CRAM batch ID".into());
+        }
+        while let Some(batch) = pending.remove(&next_batch_id) {
+            for item in batch.outputs {
+                let observation = describe_cram_output(&item)?;
+                writer.write(item)?;
+                accounted_records = accounted_records
+                    .checked_add(
+                        u64::try_from(observation.records.len())
+                            .map_err(|_| "CRAM output record count overflow")?,
+                    )
+                    .ok_or("CRAM output record count overflow")?;
+                observe_cram_output(observation, &mut sample_qc, &mut unassigned_records)?;
+            }
+            counts.merge(&batch.counts);
+            drop(batch.permit);
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or("CRAM batch ID overflow")?;
+        }
+    }
+    if !pending.is_empty() {
+        return Err(format!(
+            "CRAM output ended with a missing batch before batch {next_batch_id}"
+        ));
+    }
+    let (metadata, records, output_bytes, writer_finalization_time) = writer.finish()?;
+    if records != accounted_records {
+        return Err(format!(
+            "CRAM write-path reconciliation failed: {records} successful record writes but {accounted_records} accounted output records"
+        ));
+    }
+    Ok(CramAggregationResult {
+        counts,
+        sample_qc,
+        batches: next_batch_id,
+        unassigned_records,
+        metadata,
+        records,
+        output_bytes,
+        writer_finalization_time,
+    })
+}
+
+struct CramOutputObservation {
+    target: OutputTarget,
+    records: Vec<(OutputMate, usize)>,
+}
+
+fn describe_cram_output(item: &CramOutputItem) -> Result<CramOutputObservation, String> {
+    let records = match item {
+        CramOutputItem::Single {
+            record, trim_start, ..
+        } => vec![(OutputMate::Single, record.read.seq.len() - trim_start)],
+        CramOutputItem::Pair {
+            r1,
+            r2,
+            r1_trim,
+            r2_trim,
+            ..
+        } => vec![
+            (OutputMate::R1, r1.read.seq.len() - r1_trim),
+            (OutputMate::R2, r2.read.seq.len() - r2_trim),
+        ],
+        CramOutputItem::Orphan { mate, record, .. } => {
+            vec![(*mate, record.read.seq.len())]
+        }
+    };
+    Ok(CramOutputObservation {
+        target: item.target(),
+        records,
+    })
+}
+
+fn observe_cram_output(
+    observation: CramOutputObservation,
+    sample_qc: &mut SampleQc,
+    unassigned_records: &mut u64,
+) -> Result<(), String> {
+    let CramOutputObservation { target, records } = observation;
+    match target {
+        OutputTarget::Sample { sample_id } => {
+            for (mate, bases) in records {
+                sample_qc.observe_output(
+                    sample_id,
+                    mate,
+                    1,
+                    u64::try_from(bases).map_err(|_| "Read length overflow")?,
+                )?;
+            }
+        }
+        OutputTarget::Unassigned => {
+            *unassigned_records = unassigned_records
+                .checked_add(
+                    u64::try_from(records.len())
+                        .map_err(|_| "Unassigned CRAM record count overflow")?,
+                )
+                .ok_or("Unassigned CRAM record count overflow")?;
+        }
+    }
     Ok(())
 }
 
@@ -1592,6 +2433,9 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
                     buffers.push_record(OutputTarget::Unassigned, mate, &record, 0)?;
                 }
             }
+            WorkItem::CramSingle(_) | WorkItem::CramPair { .. } | WorkItem::CramOrphan { .. } => {
+                return Err("Internal error: CRAM work reached FASTQ output adapter".into());
+            }
         }
     }
 
@@ -1611,14 +2455,7 @@ fn process_single_record(
     buffers: &mut BatchBuffers,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let route = if let Some(route) = state.routing.route_read(&record.seq, None)? {
-        route
-    } else {
-        counts.short_reads += 1;
-        RouteResult::Unmatched
-    };
-
-    let (target, trim_start) = route_to_output(route, state.r1_prefix, counts);
+    let (target, trim_start) = route_single_record(&record, state, counts)?;
 
     if should_emit(target, state.write_unassigned) {
         buffers.push_record(target, OutputMate::Single, &record, trim_start)?;
@@ -1634,32 +2471,49 @@ fn process_pair(
     buffers: &mut BatchBuffers,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
+    let (target, r1_trim, r2_trim) = route_pair_records(&r1, &r2, state, counts)?;
+
+    if should_emit(target, state.write_unassigned) {
+        buffers.push_record(target, OutputMate::R1, &r1, r1_trim)?;
+        buffers.push_record(target, OutputMate::R2, &r2, r2_trim)?;
+    }
+
+    Ok(())
+}
+
+fn route_single_record(
+    record: &OwnedFastqRecord,
+    state: &SharedState,
+    counts: &mut DemuxCounts,
+) -> Result<(OutputTarget, usize), String> {
+    let route = if let Some(route) = state.routing.route_read(&record.seq, None)? {
+        route
+    } else {
+        counts.short_reads += 1;
+        RouteResult::Unmatched
+    };
+    Ok(route_to_output(route, state.r1_prefix, counts))
+}
+
+fn route_pair_records(
+    r1: &OwnedFastqRecord,
+    r2: &OwnedFastqRecord,
+    state: &SharedState,
+    counts: &mut DemuxCounts,
+) -> Result<(OutputTarget, usize, usize), String> {
     let route = if let Some(route) = state.routing.route_read(&r1.seq, Some(&r2.seq))? {
         route
     } else {
         counts.short_reads += 1;
         RouteResult::Unmatched
     };
-
     let assigned = matches!(route, RouteResult::Assigned { .. });
     let target = route_to_target(route, counts);
-
-    if should_emit(target, state.write_unassigned) {
-        buffers.push_record(
-            target,
-            OutputMate::R1,
-            &r1,
-            if assigned { state.r1_prefix } else { 0 },
-        )?;
-        buffers.push_record(
-            target,
-            OutputMate::R2,
-            &r2,
-            if assigned { state.r2_prefix } else { 0 },
-        )?;
-    }
-
-    Ok(())
+    Ok((
+        target,
+        if assigned { state.r1_prefix } else { 0 },
+        if assigned { state.r2_prefix } else { 0 },
+    ))
 }
 
 fn should_emit(target: OutputTarget, write_unassigned: bool) -> bool {
@@ -2073,6 +2927,70 @@ fn print_chunk_summary(uncompressed_bytes: u64, writer: &WriterResult) {
         },
         writer.compressed_bytes,
     );
+}
+
+fn produce_cram(
+    path: &Path,
+    mode: ReadMode,
+    decode_threads: usize,
+    preserve_metadata: bool,
+    batcher: &mut BatchSender,
+    mut r1_stats: Option<&mut MateQcStats>,
+    mut r2_stats: Option<&mut MateQcStats>,
+) -> Result<(), String> {
+    crate::cram::read_items(path, mode, decode_threads, |item| match item {
+        CramInputItem::Single(record) => {
+            if let Some(stats) = r1_stats.as_deref_mut() {
+                stats.update(&record.read.seq, &record.read.qual)?;
+            }
+            if preserve_metadata {
+                batcher.push(WorkItem::CramSingle(record))
+            } else {
+                batcher.push(WorkItem::Single(record.read))
+            }
+        }
+        CramInputItem::Pair { r1, r2, r1_first } => {
+            if let Some(stats) = r1_stats.as_deref_mut() {
+                stats.update(&r1.read.seq, &r1.read.qual)?;
+            }
+            if let Some(stats) = r2_stats.as_deref_mut() {
+                stats.update(&r2.read.seq, &r2.read.qual)?;
+            }
+            if preserve_metadata {
+                batcher.push(WorkItem::CramPair { r1, r2, r1_first })
+            } else {
+                batcher.push(WorkItem::Pair {
+                    r1: r1.read,
+                    r2: r2.read,
+                })
+            }
+        }
+        CramInputItem::Orphan { mate, record } => {
+            match mate {
+                OutputMate::R1 => {
+                    if let Some(stats) = r1_stats.as_deref_mut() {
+                        stats.update(&record.read.seq, &record.read.qual)?;
+                    }
+                }
+                OutputMate::R2 => {
+                    if let Some(stats) = r2_stats.as_deref_mut() {
+                        stats.update(&record.read.seq, &record.read.qual)?;
+                    }
+                }
+                OutputMate::Single => {
+                    return Err("Internal error: CRAM orphan cannot be single-end".into());
+                }
+            }
+            if preserve_metadata {
+                batcher.push(WorkItem::CramOrphan { mate, record })
+            } else {
+                batcher.push(WorkItem::Orphan {
+                    mate,
+                    record: record.read,
+                })
+            }
+        }
+    })
 }
 
 fn produce_single(
@@ -2751,6 +3669,14 @@ mod tests {
     }
 
     #[test]
+    fn fastq_owned_record_layout_did_not_gain_cram_metadata() {
+        assert_eq!(
+            std::mem::size_of::<OwnedFastqRecord>(),
+            3 * std::mem::size_of::<Vec<u8>>()
+        );
+    }
+
+    #[test]
     fn compression_credits_respect_count_and_byte_limits() {
         let mib = 1024 * 1024;
         assert_eq!(compression_outstanding_limit(32, mib, 512 * mib), Ok(64));
@@ -2853,6 +3779,9 @@ mod tests {
             reads: (!paired).then_some(reads.clone()),
             r1: paired.then_some(reads),
             r2,
+            cram: None,
+            read_mode: None,
+            output_format: None,
             structure: (!paired).then(|| "R1_4A2T".into()),
             r1_structure: paired.then(|| "R1_4A2T".into()),
             r2_structure: paired.then(|| "R2_2T".into()),
@@ -2870,7 +3799,7 @@ mod tests {
             low_sample_fraction: 0.05,
         };
 
-        let error = run(args, 8, inputs).unwrap_err();
+        let error = run(args, 8, InputSource::Fastq(inputs)).unwrap_err();
         let expected_root = if failure_kind == "error" {
             assert!(error.contains("failed"), "unexpected error: {error}");
             format!("injected {stage} fatal error")

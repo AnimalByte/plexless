@@ -5,7 +5,12 @@ import argparse
 import re
 from pathlib import Path
 
-KEYS = ("total", "assigned", "unmatched", "ambiguous", "unrouted")
+REQUIRED_KEYS = ("total", "assigned", "unmatched", "ambiguous", "unrouted")
+OPTIONAL_LABELS = {
+    "short_reads": "short reads",
+    "orphan_r1": "orphan R1",
+    "orphan_r2": "orphan R2",
+}
 
 
 def parse_expected(path: Path) -> dict[str, int]:
@@ -22,11 +27,11 @@ def parse_expected(path: Path) -> dict[str, int]:
     return expected
 
 
-def parse_summary(path: Path) -> dict[str, int]:
+def parse_summary(path: Path, keys: set[str]) -> dict[str, int]:
     text = path.read_text()
     observed: dict[str, int] = {}
 
-    for key in KEYS:
+    for key in REQUIRED_KEYS:
         match = re.search(
             rf"^\s*{re.escape(key)}:\s+(\d+)\s*$",
             text,
@@ -35,6 +40,16 @@ def parse_summary(path: Path) -> dict[str, int]:
         if not match:
             raise SystemExit(f"Could not find '{key}' in plexless summary: {path}")
         observed[key] = int(match.group(1))
+
+    for key, label in OPTIONAL_LABELS.items():
+        if key not in keys:
+            continue
+        match = re.search(
+            rf"^\s*{re.escape(label)}:\s+(\d+)\s*$",
+            text,
+            flags=re.MULTILINE,
+        )
+        observed[key] = int(match.group(1)) if match else 0
 
     return observed
 
@@ -46,13 +61,16 @@ def main() -> None:
     args = p.parse_args()
 
     expected = parse_expected(args.expected)
-    observed = parse_summary(args.summary)
+    observed = parse_summary(args.summary, set(expected))
 
     failed = False
     print("Category      Expected      Observed      Result")
     print("------------------------------------------------")
 
-    for key in KEYS:
+    keys = list(REQUIRED_KEYS) + [
+        key for key in OPTIONAL_LABELS if key in expected
+    ]
+    for key in keys:
         e = expected[key]
         o = observed[key]
         ok = e == o

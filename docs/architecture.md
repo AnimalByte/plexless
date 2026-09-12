@@ -2,21 +2,36 @@
 
 ## Streaming data flow
 
-Plexless uses a bounded streaming pipeline:
+Plexless uses a bounded streaming pipeline. Input selection happens above the
+qualified routing core:
 
 ```text
-FASTQ input
-  -> Needletail parsing / parallel gzip decoding
+FASTQ input -> Needletail parsing / parallel gzip decoding --+
+                                                           |
+unmapped CRAM -> HTSlib reader/background decode, validation+
   -> bounded record batches
   -> demultiplexing workers
-  -> selected direct or buffered output strategy
-  -> bounded output-writer cache
+  -> FASTQ: selected direct/buffered serialization and gzip writers
+     CRAM: ordered HTSlib metadata-preserving record writers
 ```
 
 Paired input validates normalized record IDs and uses bounded lookahead to
 resynchronize, emitting records present in only one input as orphans. Assigned
 reads have each mate's declared structured prefix trimmed; unassigned and
 orphan reads remain untrimmed.
+
+`InputSource` keeps one-file CRAM separate from FASTQ's `Single`/`Paired`
+paths. Both frontends produce the existing owned `id`/`seq`/`qual` record and
+`WorkItem` concepts. CRAM numeric Phred qualities are normalized to Phred+33 at
+that boundary. Optional CRAM source records exist only in CRAM-specific work
+variants and are ignored by routing. The ordinary FASTQ record remains three
+`Vec<u8>` values, so the metadata carrier adds no per-record FASTQ allocation
+or struct-size cost.
+
+CRAM output diverges only after the shared route/trim decision. Its ordered
+writer updates SEQ/QUAL in the carried source record and applies the documented
+metadata policy. FASTQ output retains its established byte serialization,
+compression, buffering, and writer paths unchanged.
 
 ## Compiled hierarchical model
 
@@ -130,6 +145,14 @@ uses append mode and does not invalidate its concatenated gzip stream.
 Linux reads the limit from `/proc/self/limits`; other platforms use the safe
 256-file fallback unless `--max-open-files` selects a lower value.
 
+CRAM is deliberately different: its stream cannot use the gzip member-reopen
+model. All potentially populated CRAM destinations remain open, so startup
+preflights the destination count plus a 64-descriptor reserve. Unix builds
+raise a low soft `RLIMIT_NOFILE` only within the existing hard limit and fail
+before output creation when the hard limit is insufficient. Open HTSlib CRAM
+writers also have linear memory cost; measured peak RSS was about 152/291/575
+MiB at 384/750/1,500 active output files on the qualification host.
+
 Direct mode does not allocate persistent accumulators or separate compression
 queues. Its work/result queues and end-to-end batch credits remain bounded, and
 each in-flight batch contains at most one serialized fragment per populated
@@ -144,6 +167,16 @@ it explicitly. Larger budgets split the existing shared worker allocation and
 remain within it. `--threads 1` continues to use the serial reference path.
 Direct parallel runs use the shared worker pool for combined routing and
 compression rather than splitting it into two stages.
+
+CRAM thread planning is isolated from FASTQ planning. rust-htslib
+`Reader::set_threads(N)` supplies `N` additional HTSlib decoder workers. For
+CRAM-to-FASTQ, one quarter of budgets of four or more is assigned to decode,
+capped at eight. CRAM-to-CRAM uses one decoder worker because its single
+ordered writer is the measured limiter. One reader and one output writer are
+accounted before allocating the remaining Plexless workers. `--threads 1`
+instead reads, routes, and writes inline on the caller thread. Budgets of four
+or more stay within the request; the two-thread staged minimum overcommit is
+logged explicitly, with no HTSlib background decoding at that budget.
 
 ## Completion and QC invariants
 
@@ -173,6 +206,13 @@ metrics. Thus any Rust error, caught worker panic, process interruption, or
 final-report failure before that completion point leaves an unmistakable
 partial-run marker. Existing marked directories are rejected rather than
 appended to.
+
+For CRAM, the writer adapter calls HTSlib `hts_close` explicitly and checks its
+status because rust-htslib 1.0.1 exposes closure only through `Drop`, which
+discards that status. Successful-write observations drive mate-aware
+per-sample/unassigned reconciliation. Production does not reopen completed
+CRAM outputs; full decoding, logical hashes, metadata checks, and independent
+`samtools quickcheck` are external qualification responsibilities.
 
 ## Failure and cancellation model
 

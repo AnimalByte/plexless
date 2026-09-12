@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::barcodes::BarcodeCatalog;
 use crate::cli::DemuxArgs;
 use crate::fastq::InputReader;
-use crate::input::{InputFiles, resolve_inputs};
+use crate::input::{InputFiles, InputSource, resolve_input_source, resolve_inputs};
 use crate::output::{
     OutputLayout, ResolvedOutputMode, available_memory_bytes, calculate_output_buffer_policy,
     report_output_mode, resolve_output_mode,
@@ -91,13 +91,16 @@ pub fn run_with_threads(args: DemuxArgs, threads: usize) -> Result<(), String> {
         return Err("Thread count must be greater than 0".into());
     }
 
-    let inputs = resolve_inputs(&args)?;
+    let input = resolve_input_source(&args)?;
 
-    if threads == 1 {
-        return run_resolved(args, inputs);
+    if let InputSource::Fastq(inputs) = input {
+        if threads == 1 {
+            return run_resolved(args, inputs);
+        }
+        return crate::parallel::run(args, threads, InputSource::Fastq(inputs));
     }
 
-    crate::parallel::run(args, threads, inputs)
+    crate::parallel::run(args, threads, input)
 }
 
 pub fn run(args: DemuxArgs) -> Result<(), String> {

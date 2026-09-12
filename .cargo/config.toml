@@ -1,0 +1,6 @@
+# hts-sys requests libz-sys's `static` feature transitively.  Preserve
+# Plexless's established system-zlib backend for flate2 and let HTSlib link the
+# same dynamic library.  libz-sys documents LIBZ_SYS_STATIC as the override for
+# this exact transitive-static situation.
+[env]
+LIBZ_SYS_STATIC = "0"
