@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,9 +20,9 @@ use crate::cram::{
 use crate::demux::{DemuxCounts, core_read_id, print_summary, write_fastq_stats};
 use crate::input::{InputFiles, InputSource};
 use crate::output::{
-    CompressionJob, OutputAccumulator, OutputKey, OutputLayout, OutputMate, OutputTarget,
-    ResolvedOutputMode, available_memory_bytes, calculate_output_buffer_policy, report_output_mode,
-    resolve_output_mode,
+    CompressionFlushReason, CompressionJob, OutputAccumulator, OutputKey, OutputLayout, OutputMate,
+    OutputTarget, ResolvedOutputMode, available_memory_bytes, calculate_fastq_output_buffer_policy,
+    calculate_output_buffer_policy, report_output_mode, resolve_output_mode,
 };
 use crate::parallel_input::ParallelInput;
 use crate::qc::{SampleQc, SampleQcSummary};
@@ -43,6 +41,614 @@ const PAIRED_READER_QUEUE: usize = 256;
 const BATCH_SIZE: usize = 1024;
 const QUEUE_DEPTH_PER_WORKER: usize = 2;
 const MAX_QUEUED_BATCHES: usize = 32;
+const BUFFERED_TELEMETRY_ENV: &str = "PLEXLESS_VALIDATION_BUFFERED_TELEMETRY";
+const FASTQ_READY_QUEUE_FACTOR: usize = 8;
+const FASTQ_CREDIT_FACTOR: usize = 8;
+const FASTQ_BLOCK_QUEUE: usize = 2;
+const FASTQ_BLOCK_BYTE_CAPACITY_PER_RECORD: usize = 384;
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    duration_ns(started.elapsed())
+}
+
+fn histogram_bucket(value: u64, bounds: &[u64]) -> usize {
+    bounds
+        .iter()
+        .position(|bound| value <= *bound)
+        .unwrap_or(bounds.len())
+}
+
+const JOB_SIZE_BOUNDS: [u64; 7] = [
+    64 * 1024,
+    128 * 1024,
+    192 * 1024,
+    256 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+];
+const WAIT_NS_BOUNDS: [u64; 7] = [
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+
+#[derive(Default)]
+struct AggregationTelemetry {
+    batches: u64,
+    receive_wait_ns: u64,
+    ordered_gap_wait_ns: u64,
+    out_of_order_arrivals: u64,
+    reorder_depth_samples: u64,
+    reorder_depth_sum: u64,
+    reorder_depth_max: usize,
+    handle_ns: u64,
+    append_ns: u64,
+    fragments: u64,
+    records: u64,
+    bytes: u64,
+    active_buffers_max: usize,
+    buffered_bytes_max: usize,
+    jobs: u64,
+    job_bytes: u64,
+    job_size_min: u64,
+    job_size_max: u64,
+    job_size_histogram: [u64; 8],
+    job_sizes: Vec<u64>,
+    threshold_flushes: u64,
+    pressure_flushes: u64,
+    memory_pressure_events: u64,
+    pressure_bytes: u64,
+    final_flushes: u64,
+    pressure_by_destination: Vec<u64>,
+    credit_acquisitions: u64,
+    credit_exhausted: u64,
+    credit_wait_ns: u64,
+    credit_wait_max_ns: u64,
+    credit_wait_histogram: [u64; 8],
+    compression_send_ns: u64,
+    compression_send_full: u64,
+    jobs_per_second: Vec<u64>,
+    accumulator_batches: u64,
+    zero_job_batches: u64,
+    job_burst_max: u64,
+    job_burst_histogram: [u64; 7],
+    elapsed_ns: u64,
+}
+
+impl AggregationTelemetry {
+    fn new(stream_count: usize) -> Self {
+        Self {
+            job_size_min: u64::MAX,
+            pressure_by_destination: vec![0; stream_count],
+            ..Self::default()
+        }
+    }
+
+    fn observe_reorder_depth(&mut self, depth: usize) {
+        self.reorder_depth_samples = self.reorder_depth_samples.saturating_add(1);
+        self.reorder_depth_sum = self.reorder_depth_sum.saturating_add(depth as u64);
+        self.reorder_depth_max = self.reorder_depth_max.max(depth);
+    }
+
+    fn observe_job(
+        &mut self,
+        job: &CompressionJob,
+        layout: OutputLayout,
+        pipeline_started: Instant,
+    ) -> Result<(), String> {
+        let bytes =
+            u64::try_from(job.fastq_bytes.len()).map_err(|_| "Compression job size overflow")?;
+        self.jobs = self.jobs.saturating_add(1);
+        self.job_bytes = self.job_bytes.saturating_add(bytes);
+        self.job_size_min = self.job_size_min.min(bytes);
+        self.job_size_max = self.job_size_max.max(bytes);
+        self.job_size_histogram[histogram_bucket(bytes, &JOB_SIZE_BOUNDS)] += 1;
+        self.job_sizes.push(bytes);
+        match job.flush_reason {
+            CompressionFlushReason::ChunkThreshold => self.threshold_flushes += 1,
+            CompressionFlushReason::MemoryPressure => {
+                self.pressure_flushes += 1;
+                self.pressure_bytes = self.pressure_bytes.saturating_add(bytes);
+                let index = layout.stream_index(job.key)?;
+                self.pressure_by_destination[index] =
+                    self.pressure_by_destination[index].saturating_add(1);
+            }
+            CompressionFlushReason::FinalDrain => self.final_flushes += 1,
+        }
+        let second = usize::try_from(pipeline_started.elapsed().as_secs()).unwrap_or(usize::MAX);
+        if second != usize::MAX {
+            if self.jobs_per_second.len() <= second {
+                self.jobs_per_second.resize(second + 1, 0);
+            }
+            self.jobs_per_second[second] = self.jobs_per_second[second].saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn observe_batch_jobs(&mut self, jobs: u64) {
+        const JOB_BURST_BOUNDS: [u64; 6] = [0, 16, 32, 64, 128, 256];
+        self.accumulator_batches = self.accumulator_batches.saturating_add(1);
+        if jobs == 0 {
+            self.zero_job_batches = self.zero_job_batches.saturating_add(1);
+        }
+        self.job_burst_max = self.job_burst_max.max(jobs);
+        self.job_burst_histogram[histogram_bucket(jobs, &JOB_BURST_BOUNDS)] += 1;
+    }
+
+    fn merge_accumulator(&mut self, accumulator: Self) {
+        self.handle_ns = self.handle_ns.saturating_add(accumulator.handle_ns);
+        self.append_ns = self.append_ns.saturating_add(accumulator.append_ns);
+        self.fragments = self.fragments.saturating_add(accumulator.fragments);
+        self.records = self.records.saturating_add(accumulator.records);
+        self.bytes = self.bytes.saturating_add(accumulator.bytes);
+        self.active_buffers_max = self
+            .active_buffers_max
+            .saturating_add(accumulator.active_buffers_max);
+        self.buffered_bytes_max = self
+            .buffered_bytes_max
+            .saturating_add(accumulator.buffered_bytes_max);
+        self.jobs = self.jobs.saturating_add(accumulator.jobs);
+        self.job_bytes = self.job_bytes.saturating_add(accumulator.job_bytes);
+        self.job_size_min = self.job_size_min.min(accumulator.job_size_min);
+        self.job_size_max = self.job_size_max.max(accumulator.job_size_max);
+        for (total, value) in self
+            .job_size_histogram
+            .iter_mut()
+            .zip(accumulator.job_size_histogram)
+        {
+            *total = total.saturating_add(value);
+        }
+        self.job_sizes.extend(accumulator.job_sizes);
+        self.threshold_flushes = self
+            .threshold_flushes
+            .saturating_add(accumulator.threshold_flushes);
+        self.pressure_flushes = self
+            .pressure_flushes
+            .saturating_add(accumulator.pressure_flushes);
+        self.memory_pressure_events = self
+            .memory_pressure_events
+            .saturating_add(accumulator.memory_pressure_events);
+        self.pressure_bytes = self
+            .pressure_bytes
+            .saturating_add(accumulator.pressure_bytes);
+        self.final_flushes = self.final_flushes.saturating_add(accumulator.final_flushes);
+        for (total, value) in self
+            .pressure_by_destination
+            .iter_mut()
+            .zip(accumulator.pressure_by_destination)
+        {
+            *total = total.saturating_add(value);
+        }
+        self.credit_acquisitions = self
+            .credit_acquisitions
+            .saturating_add(accumulator.credit_acquisitions);
+        self.credit_exhausted = self
+            .credit_exhausted
+            .saturating_add(accumulator.credit_exhausted);
+        self.credit_wait_ns = self
+            .credit_wait_ns
+            .saturating_add(accumulator.credit_wait_ns);
+        self.credit_wait_max_ns = self.credit_wait_max_ns.max(accumulator.credit_wait_max_ns);
+        for (total, value) in self
+            .credit_wait_histogram
+            .iter_mut()
+            .zip(accumulator.credit_wait_histogram)
+        {
+            *total = total.saturating_add(value);
+        }
+        self.compression_send_ns = self
+            .compression_send_ns
+            .saturating_add(accumulator.compression_send_ns);
+        self.compression_send_full = self
+            .compression_send_full
+            .saturating_add(accumulator.compression_send_full);
+        if self.jobs_per_second.len() < accumulator.jobs_per_second.len() {
+            self.jobs_per_second
+                .resize(accumulator.jobs_per_second.len(), 0);
+        }
+        for (second, value) in accumulator.jobs_per_second.into_iter().enumerate() {
+            self.jobs_per_second[second] = self.jobs_per_second[second].saturating_add(value);
+        }
+        self.accumulator_batches = self
+            .accumulator_batches
+            .saturating_add(accumulator.accumulator_batches);
+        self.zero_job_batches = self
+            .zero_job_batches
+            .saturating_add(accumulator.zero_job_batches);
+        self.job_burst_max = self.job_burst_max.max(accumulator.job_burst_max);
+        for (total, value) in self
+            .job_burst_histogram
+            .iter_mut()
+            .zip(accumulator.job_burst_histogram)
+        {
+            *total = total.saturating_add(value);
+        }
+    }
+}
+
+struct QueueTimeline {
+    started: Instant,
+    last_observation: Instant,
+    last_depth: usize,
+    capacity: usize,
+    depth_ns: u128,
+    category_ns: [u128; 4],
+    samples: u64,
+    sample_depth_sum: u64,
+    max_depth: usize,
+}
+
+impl QueueTimeline {
+    fn new(capacity: usize, started: Instant) -> Self {
+        Self {
+            started,
+            last_observation: started,
+            last_depth: 0,
+            capacity,
+            depth_ns: 0,
+            category_ns: [0; 4],
+            samples: 0,
+            sample_depth_sum: 0,
+            max_depth: 0,
+        }
+    }
+
+    fn category(&self, depth: usize) -> usize {
+        if depth == 0 {
+            0
+        } else if depth <= self.capacity.div_ceil(4) {
+            1
+        } else if depth < self.capacity {
+            2
+        } else {
+            3
+        }
+    }
+
+    fn observe(&mut self, depth: usize, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.last_observation)
+            .as_nanos();
+        self.depth_ns = self
+            .depth_ns
+            .saturating_add(elapsed.saturating_mul(self.last_depth as u128));
+        let category = self.category(self.last_depth);
+        self.category_ns[category] = self.category_ns[category].saturating_add(elapsed);
+        self.last_observation = now;
+        self.last_depth = depth.min(self.capacity);
+        self.samples = self.samples.saturating_add(1);
+        self.sample_depth_sum = self.sample_depth_sum.saturating_add(depth as u64);
+        self.max_depth = self.max_depth.max(depth);
+    }
+
+    fn snapshot(&self, now: Instant) -> QueueSnapshot {
+        let tail = now
+            .saturating_duration_since(self.last_observation)
+            .as_nanos();
+        let elapsed = now
+            .saturating_duration_since(self.started)
+            .as_nanos()
+            .max(1);
+        let mut categories = self.category_ns;
+        categories[self.category(self.last_depth)] =
+            categories[self.category(self.last_depth)].saturating_add(tail);
+        let depth_ns = self
+            .depth_ns
+            .saturating_add(tail.saturating_mul(self.last_depth as u128));
+        QueueSnapshot {
+            average_depth: depth_ns as f64 / elapsed as f64,
+            sampled_average_depth: if self.samples == 0 {
+                0.0
+            } else {
+                self.sample_depth_sum as f64 / self.samples as f64
+            },
+            max_depth: self.max_depth,
+            category_percent: categories.map(|value| value as f64 * 100.0 / elapsed as f64),
+        }
+    }
+}
+
+struct QueueSnapshot {
+    average_depth: f64,
+    sampled_average_depth: f64,
+    max_depth: usize,
+    category_percent: [f64; 4],
+}
+
+struct CompressionWorkerTelemetry {
+    jobs: AtomicU64,
+    receive_wait_ns: AtomicU64,
+    ready_queue_wait_ns: AtomicU64,
+    busy_ns: AtomicU64,
+    send_ns: AtomicU64,
+}
+
+impl CompressionWorkerTelemetry {
+    fn new() -> Self {
+        Self {
+            jobs: AtomicU64::new(0),
+            receive_wait_ns: AtomicU64::new(0),
+            ready_queue_wait_ns: AtomicU64::new(0),
+            busy_ns: AtomicU64::new(0),
+            send_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+struct BufferedTelemetry {
+    started: Instant,
+    result_queue_capacity: usize,
+    compression_queue_capacity: usize,
+    completed_queue_capacity: usize,
+    compression_credit_limit: usize,
+    memory_budget: usize,
+    aggregation: Mutex<Option<AggregationTelemetry>>,
+    result_queue: Mutex<QueueTimeline>,
+    compression_queue: Mutex<QueueTimeline>,
+    completed_queue: Mutex<QueueTimeline>,
+    routing_batches: AtomicU64,
+    routing_send_ns: AtomicU64,
+    routing_send_full: AtomicU64,
+    workers: Vec<CompressionWorkerTelemetry>,
+    completed_to_append_ns: AtomicU64,
+    writer_receive_wait_ns: AtomicU64,
+    writer_append_ns: AtomicU64,
+    writer_finish_ns: AtomicU64,
+    writer_chunks: AtomicU64,
+    writer_pending_max: AtomicUsize,
+}
+
+impl BufferedTelemetry {
+    fn new(
+        result_queue_capacity: usize,
+        compression_queue_capacity: usize,
+        completed_queue_capacity: usize,
+        compression_credit_limit: usize,
+        memory_budget: usize,
+        stream_count: usize,
+        compression_workers: usize,
+    ) -> Arc<Self> {
+        let started = Instant::now();
+        Arc::new(Self {
+            started,
+            result_queue_capacity,
+            compression_queue_capacity,
+            completed_queue_capacity,
+            compression_credit_limit,
+            memory_budget,
+            aggregation: Mutex::new(Some(AggregationTelemetry::new(stream_count))),
+            result_queue: Mutex::new(QueueTimeline::new(result_queue_capacity, started)),
+            compression_queue: Mutex::new(QueueTimeline::new(compression_queue_capacity, started)),
+            completed_queue: Mutex::new(QueueTimeline::new(completed_queue_capacity, started)),
+            routing_batches: AtomicU64::new(0),
+            routing_send_ns: AtomicU64::new(0),
+            routing_send_full: AtomicU64::new(0),
+            workers: (0..compression_workers)
+                .map(|_| CompressionWorkerTelemetry::new())
+                .collect(),
+            completed_to_append_ns: AtomicU64::new(0),
+            writer_receive_wait_ns: AtomicU64::new(0),
+            writer_append_ns: AtomicU64::new(0),
+            writer_finish_ns: AtomicU64::new(0),
+            writer_chunks: AtomicU64::new(0),
+            writer_pending_max: AtomicUsize::new(0),
+        })
+    }
+
+    fn observe_queue(queue: &Mutex<QueueTimeline>, depth: usize) {
+        queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(depth, Instant::now());
+    }
+
+    fn report(&self) {
+        let now = Instant::now();
+        let elapsed_seconds = now.duration_since(self.started).as_secs_f64();
+        let aggregation = self
+            .aggregation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(aggregation) = aggregation.as_ref() else {
+            eprintln!("Buffered telemetry: aggregation metrics unavailable");
+            return;
+        };
+        let result_queue = self
+            .result_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(now);
+        let compression_queue = self
+            .compression_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(now);
+        let completed_queue = self
+            .completed_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(now);
+        let worker_jobs: u64 = self
+            .workers
+            .iter()
+            .map(|worker| worker.jobs.load(Ordering::Relaxed))
+            .sum();
+        let worker_wait_ns: u64 = self
+            .workers
+            .iter()
+            .map(|worker| worker.receive_wait_ns.load(Ordering::Relaxed))
+            .sum();
+        let worker_queue_wait_ns: u64 = self
+            .workers
+            .iter()
+            .map(|worker| worker.ready_queue_wait_ns.load(Ordering::Relaxed))
+            .sum();
+        let worker_busy_ns: u64 = self
+            .workers
+            .iter()
+            .map(|worker| worker.busy_ns.load(Ordering::Relaxed))
+            .sum();
+        let worker_send_ns: u64 = self
+            .workers
+            .iter()
+            .map(|worker| worker.send_ns.load(Ordering::Relaxed))
+            .sum();
+        let worker_observed_ns = worker_wait_ns.saturating_add(worker_busy_ns).max(1);
+        let pressure_destinations = aggregation
+            .pressure_by_destination
+            .iter()
+            .filter(|count| **count > 0)
+            .count();
+        let pressure_destination_max = aggregation
+            .pressure_by_destination
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let job_size_min = if aggregation.jobs == 0 {
+            0
+        } else {
+            aggregation.job_size_min
+        };
+        let mut job_sizes = aggregation.job_sizes.clone();
+        job_sizes.sort_unstable();
+        let job_percentile = |percent: usize| {
+            if job_sizes.is_empty() {
+                0
+            } else {
+                job_sizes[(job_sizes.len() - 1) * percent / 100]
+            }
+        };
+        eprintln!(
+            "Buffered telemetry: elapsed_s={elapsed_seconds:.6} result_queue_capacity={} compression_queue_capacity={} completed_queue_capacity={} compression_credit_limit={} memory_budget={} compression_workers={}",
+            self.result_queue_capacity,
+            self.compression_queue_capacity,
+            self.completed_queue_capacity,
+            self.compression_credit_limit,
+            self.memory_budget,
+            self.workers.len(),
+        );
+        eprintln!(
+            "Buffered telemetry aggregation: batches={} receive_wait_s={:.6} ordered_gap_wait_s={:.6} out_of_order_arrivals={} reorder_avg={:.3} reorder_max={} handle_s={:.6} append_s={:.6} fragments={} records={} bytes={} active_buffers_max={} buffered_bytes_max={}",
+            aggregation.batches,
+            aggregation.receive_wait_ns as f64 / 1e9,
+            aggregation.ordered_gap_wait_ns as f64 / 1e9,
+            aggregation.out_of_order_arrivals,
+            if aggregation.reorder_depth_samples == 0 {
+                0.0
+            } else {
+                aggregation.reorder_depth_sum as f64 / aggregation.reorder_depth_samples as f64
+            },
+            aggregation.reorder_depth_max,
+            aggregation.handle_ns as f64 / 1e9,
+            aggregation.append_ns as f64 / 1e9,
+            aggregation.fragments,
+            aggregation.records,
+            aggregation.bytes,
+            aggregation.active_buffers_max,
+            aggregation.buffered_bytes_max,
+        );
+        eprintln!(
+            "Buffered telemetry jobs: count={} bytes={} rate_per_s={:.3} min={} avg={:.1} max={} size_hist={:?} threshold={} pressure={} pressure_events={} pressure_bytes={} pressure_destinations={} pressure_destination_max={} final={} per_second={:?}",
+            aggregation.jobs,
+            aggregation.job_bytes,
+            aggregation.jobs as f64 / (aggregation.elapsed_ns as f64 / 1e9).max(f64::EPSILON),
+            job_size_min,
+            if aggregation.jobs == 0 {
+                0.0
+            } else {
+                aggregation.job_bytes as f64 / aggregation.jobs as f64
+            },
+            aggregation.job_size_max,
+            aggregation.job_size_histogram,
+            aggregation.threshold_flushes,
+            aggregation.pressure_flushes,
+            aggregation.memory_pressure_events,
+            aggregation.pressure_bytes,
+            pressure_destinations,
+            pressure_destination_max,
+            aggregation.final_flushes,
+            aggregation.jobs_per_second,
+        );
+        eprintln!(
+            "Buffered telemetry job-percentiles: p50={} p90={} p95={} p99={}",
+            job_percentile(50),
+            job_percentile(90),
+            job_percentile(95),
+            job_percentile(99),
+        );
+        eprintln!(
+            "Buffered telemetry job-bursts: accumulator_batches={} zero_job_batches={} zero_percent={:.3} max_jobs_per_batch={} histogram_0_16_32_64_128_256_over={:?}",
+            aggregation.accumulator_batches,
+            aggregation.zero_job_batches,
+            aggregation.zero_job_batches as f64 * 100.0
+                / aggregation.accumulator_batches.max(1) as f64,
+            aggregation.job_burst_max,
+            aggregation.job_burst_histogram,
+        );
+        eprintln!(
+            "Buffered telemetry credits: acquisitions={} exhausted={} wait_s={:.6} wait_max_ms={:.3} wait_hist={:?} compression_send_s={:.6} compression_send_full={}",
+            aggregation.credit_acquisitions,
+            aggregation.credit_exhausted,
+            aggregation.credit_wait_ns as f64 / 1e9,
+            aggregation.credit_wait_max_ns as f64 / 1e6,
+            aggregation.credit_wait_histogram,
+            aggregation.compression_send_ns as f64 / 1e9,
+            aggregation.compression_send_full,
+        );
+        report_queue_telemetry("result", &result_queue);
+        report_queue_telemetry("compression", &compression_queue);
+        report_queue_telemetry("completed", &completed_queue);
+        eprintln!(
+            "Buffered telemetry compression-workers: jobs={} busy_s={:.6} receive_wait_s={:.6} ready_queue_wait_s={:.6} send_s={:.6} busy_percent={:.3} idle_percent={:.3}",
+            worker_jobs,
+            worker_busy_ns as f64 / 1e9,
+            worker_wait_ns as f64 / 1e9,
+            worker_queue_wait_ns as f64 / 1e9,
+            worker_send_ns as f64 / 1e9,
+            worker_busy_ns as f64 * 100.0 / worker_observed_ns as f64,
+            worker_wait_ns as f64 * 100.0 / worker_observed_ns as f64,
+        );
+        eprintln!(
+            "Buffered telemetry routing-writer: routing_batches={} routing_send_s={:.6} routing_send_full={} completed_to_append_s={:.6} writer_receive_wait_s={:.6} writer_append_s={:.6} writer_finish_s={:.6} writer_chunks={} writer_pending_max={}",
+            self.routing_batches.load(Ordering::Relaxed),
+            self.routing_send_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            self.routing_send_full.load(Ordering::Relaxed),
+            self.completed_to_append_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            self.writer_receive_wait_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            self.writer_append_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            self.writer_finish_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            self.writer_chunks.load(Ordering::Relaxed),
+            self.writer_pending_max.load(Ordering::Relaxed),
+        );
+    }
+}
+
+fn report_queue_telemetry(name: &str, queue: &QueueSnapshot) {
+    eprintln!(
+        "Buffered telemetry queue-{name}: average={:.3} sampled_average={:.3} max={} empty_percent={:.3} low_percent={:.3} partial_percent={:.3} full_percent={:.3}",
+        queue.average_depth,
+        queue.sampled_average_depth,
+        queue.max_depth,
+        queue.category_percent[0],
+        queue.category_percent[1],
+        queue.category_percent[2],
+        queue.category_percent[3],
+    );
+}
+
+fn validation_switch_enabled(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
 
 #[derive(Clone)]
 struct PipelineControl {
@@ -366,6 +972,168 @@ impl OwnedFastqRecord {
     }
 }
 
+/// A checked byte range within one immutable FASTQ input block.  The range is
+/// represented with batch-relative `u32`s to keep descriptors compact while
+/// still allowing blocks up to 4 GiB.  All construction and resolution goes
+/// through checked helpers; descriptors never contain raw pointers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ByteSpan {
+    start: u32,
+    len: u32,
+}
+
+impl ByteSpan {
+    fn checked(start: usize, len: usize) -> Result<Self, String> {
+        let end = start
+            .checked_add(len)
+            .ok_or("FASTQ batch byte range overflow")?;
+        if end > u32::MAX as usize {
+            return Err(format!(
+                "FASTQ batch backing exceeds the u32 address limit of {} bytes",
+                u32::MAX
+            ));
+        }
+        Ok(Self {
+            start: u32::try_from(start).map_err(|_| "FASTQ batch offset exceeds u32")?,
+            len: u32::try_from(len).map_err(|_| "FASTQ field length exceeds u32")?,
+        })
+    }
+
+    fn resolve(self, bytes: &[u8]) -> Result<&[u8], String> {
+        let start = usize::try_from(self.start).map_err(|_| "Invalid FASTQ batch offset")?;
+        let len = usize::try_from(self.len).map_err(|_| "Invalid FASTQ field length")?;
+        let end = start
+            .checked_add(len)
+            .ok_or("FASTQ batch descriptor range overflow")?;
+        bytes
+            .get(start..end)
+            .ok_or_else(|| "FASTQ batch descriptor is outside its backing storage".to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FastqRecordDescriptor {
+    id: ByteSpan,
+    seq: ByteSpan,
+    qual: ByteSpan,
+}
+
+#[derive(Debug)]
+struct FastqReadBlock {
+    bytes: Vec<u8>,
+    records: Vec<FastqRecordDescriptor>,
+}
+
+#[derive(Clone, Copy)]
+struct FastqReadView<'a> {
+    id: &'a [u8],
+    seq: &'a [u8],
+    qual: &'a [u8],
+}
+
+impl FastqReadBlock {
+    fn record(&self, index: u32) -> Result<FastqReadView<'_>, String> {
+        let index = usize::try_from(index).map_err(|_| "Invalid FASTQ record index")?;
+        let descriptor = self
+            .records
+            .get(index)
+            .ok_or("FASTQ record descriptor index is outside its block")?;
+        Ok(FastqReadView {
+            id: descriptor.id.resolve(&self.bytes)?,
+            seq: descriptor.seq.resolve(&self.bytes)?,
+            qual: descriptor.qual.resolve(&self.bytes)?,
+        })
+    }
+}
+
+struct FastqReadBlockBuilder {
+    bytes: Vec<u8>,
+    records: Vec<FastqRecordDescriptor>,
+}
+
+impl FastqReadBlockBuilder {
+    fn new() -> Result<Self, String> {
+        let byte_capacity = BATCH_SIZE
+            .checked_mul(FASTQ_BLOCK_BYTE_CAPACITY_PER_RECORD)
+            .ok_or("FASTQ block initial capacity overflow")?;
+        Ok(Self {
+            bytes: Vec::with_capacity(byte_capacity),
+            records: Vec::with_capacity(BATCH_SIZE),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.records.len() >= BATCH_SIZE
+    }
+
+    fn push(&mut self, id: &[u8], seq: &[u8], qual: &[u8]) -> Result<(), String> {
+        if seq.len() != qual.len() {
+            return Err("Sequence and quality lengths do not match".into());
+        }
+        let total_len = id
+            .len()
+            .checked_add(seq.len())
+            .and_then(|value| value.checked_add(qual.len()))
+            .ok_or("FASTQ record byte length overflow")?;
+        let end = self
+            .bytes
+            .len()
+            .checked_add(total_len)
+            .ok_or("FASTQ batch byte length overflow")?;
+        if end > u32::MAX as usize {
+            return Err(format!(
+                "FASTQ batch backing exceeds the u32 address limit of {} bytes",
+                u32::MAX
+            ));
+        }
+
+        let id_span = ByteSpan::checked(self.bytes.len(), id.len())?;
+        self.bytes.extend_from_slice(id);
+        let seq_span = ByteSpan::checked(self.bytes.len(), seq.len())?;
+        self.bytes.extend_from_slice(seq);
+        let qual_span = ByteSpan::checked(self.bytes.len(), qual.len())?;
+        self.bytes.extend_from_slice(qual);
+        self.records.push(FastqRecordDescriptor {
+            id: id_span,
+            seq: seq_span,
+            qual: qual_span,
+        });
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Arc<FastqReadBlock>, String> {
+        if self.records.is_empty() {
+            return Err("Cannot publish an empty FASTQ read block".into());
+        }
+        Ok(Arc::new(FastqReadBlock {
+            bytes: self.bytes,
+            records: self.records,
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchFastqRecordRef {
+    block: u32,
+    record: u32,
+}
+
+#[derive(Debug)]
+struct PendingBatchRecord {
+    block: Arc<FastqReadBlock>,
+    record: u32,
+}
+
+impl PendingBatchRecord {
+    fn view(&self) -> Result<FastqReadView<'_>, String> {
+        self.block.record(self.record)
+    }
+}
+
 #[derive(Debug)]
 enum WorkItem {
     Single(OwnedFastqRecord),
@@ -376,6 +1144,15 @@ enum WorkItem {
     Orphan {
         mate: OutputMate,
         record: OwnedFastqRecord,
+    },
+    BatchSingle(BatchFastqRecordRef),
+    BatchPair {
+        r1: BatchFastqRecordRef,
+        r2: BatchFastqRecordRef,
+    },
+    BatchOrphan {
+        mate: OutputMate,
+        record: BatchFastqRecordRef,
     },
     CramSingle(CramOwnedRecord),
     CramPair {
@@ -393,6 +1170,7 @@ enum WorkItem {
 struct WorkBatch {
     id: u64,
     items: Vec<WorkItem>,
+    fastq_backings: Vec<Arc<FastqReadBlock>>,
     permit: PermitGuard,
 }
 
@@ -408,8 +1186,31 @@ struct BufferedOutput {
 struct ProcessedBatch {
     id: u64,
     outputs: Vec<BufferedOutput>,
+    referenced_outputs: Vec<ReferencedOutput>,
+    fastq_backings: Vec<Arc<FastqReadBlock>>,
     counts: DemuxCounts,
     permit: PermitGuard,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReferencedOutput {
+    key: OutputKey,
+    record: BatchFastqRecordRef,
+    trim_start: usize,
+}
+
+#[derive(Debug)]
+struct AccumulatorBatch {
+    batch_id: u64,
+    outputs: Vec<BufferedOutput>,
+    referenced_outputs: Vec<ReferencedOutput>,
+    fastq_backings: Vec<Arc<FastqReadBlock>>,
+}
+
+struct AccumulatorResult {
+    chunks: u64,
+    uncompressed_bytes: u64,
+    telemetry: AggregationTelemetry,
 }
 
 #[derive(Debug)]
@@ -441,6 +1242,7 @@ struct DirectProcessedBatch {
 struct QueuedCompressionJob {
     job: CompressionJob,
     permit: PermitGuard,
+    queued_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -449,6 +1251,7 @@ struct CompressedChunk {
     chunk_id: u64,
     member: Vec<u8>,
     uncompressed_len: usize,
+    completed_at: Option<Instant>,
     _permit: PermitGuard,
 }
 
@@ -556,6 +1359,7 @@ struct BatchSender {
     permit_returns: Sender<()>,
     next_batch_id: u64,
     items: Vec<WorkItem>,
+    fastq_backings: Vec<Arc<FastqReadBlock>>,
     allocation: Option<AllocationController>,
     control: PipelineControl,
 }
@@ -573,6 +1377,7 @@ impl BatchSender {
             permit_returns,
             next_batch_id: 0,
             items: Vec::with_capacity(BATCH_SIZE),
+            fastq_backings: Vec::new(),
             allocation: None,
             control,
         }
@@ -601,6 +1406,67 @@ impl BatchSender {
         Ok(())
     }
 
+    fn register_fastq_backing(&mut self, backing: &Arc<FastqReadBlock>) -> Result<u32, String> {
+        if let Some(index) = self
+            .fastq_backings
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, backing))
+        {
+            return u32::try_from(index)
+                .map_err(|_| "FASTQ batch backing index exceeds u32".into());
+        }
+        let index = u32::try_from(self.fastq_backings.len())
+            .map_err(|_| "FASTQ batch has too many backing blocks")?;
+        self.fastq_backings.push(Arc::clone(backing));
+        Ok(index)
+    }
+
+    fn reference(
+        &mut self,
+        backing: &Arc<FastqReadBlock>,
+        record: u32,
+    ) -> Result<BatchFastqRecordRef, String> {
+        // Resolve now as a construction-time bounds check.  Workers repeat the
+        // check before borrowing bytes, so malformed descriptors cannot become
+        // unchecked indexing later in the pipeline.
+        backing.record(record)?;
+        Ok(BatchFastqRecordRef {
+            block: self.register_fastq_backing(backing)?,
+            record,
+        })
+    }
+
+    fn push_batch_single(
+        &mut self,
+        backing: &Arc<FastqReadBlock>,
+        record: u32,
+    ) -> Result<(), String> {
+        let record = self.reference(backing, record)?;
+        self.push(WorkItem::BatchSingle(record))
+    }
+
+    fn push_batch_pair(
+        &mut self,
+        r1_backing: &Arc<FastqReadBlock>,
+        r1_record: u32,
+        r2_backing: &Arc<FastqReadBlock>,
+        r2_record: u32,
+    ) -> Result<(), String> {
+        let r1 = self.reference(r1_backing, r1_record)?;
+        let r2 = self.reference(r2_backing, r2_record)?;
+        self.push(WorkItem::BatchPair { r1, r2 })
+    }
+
+    fn push_batch_orphan(
+        &mut self,
+        mate: OutputMate,
+        backing: &Arc<FastqReadBlock>,
+        record: u32,
+    ) -> Result<(), String> {
+        let record = self.reference(backing, record)?;
+        self.push(WorkItem::BatchOrphan { mate, record })
+    }
+
     fn finish(mut self) -> Result<u64, String> {
         self.flush()?;
         Ok(self.next_batch_id)
@@ -612,10 +1478,12 @@ impl BatchSender {
         }
 
         let items = std::mem::replace(&mut self.items, Vec::with_capacity(BATCH_SIZE));
+        let fastq_backings = std::mem::take(&mut self.fastq_backings);
         let permit = acquire_permit(&self.permits, &self.permit_returns, &self.control, "batch")?;
         let batch = WorkBatch {
             id: self.next_batch_id,
             items,
+            fastq_backings,
             permit,
         };
 
@@ -728,6 +1596,22 @@ fn split_worker_slots(total: usize) -> (usize, usize) {
     (demux, total - demux)
 }
 
+fn dedicated_accumulator_worker_slots(total: usize) -> Result<(usize, usize), String> {
+    let (initial_demux, initial_compression) = split_worker_slots(total);
+    let demux_available = initial_demux.saturating_sub(1);
+    let from_demux = 1.min(demux_available);
+    let from_compression = 1 - from_demux;
+    if from_compression >= initial_compression {
+        return Err(format!(
+            "A dedicated accumulator does not fit within {total} buffered worker slots while retaining one routing and one compression worker"
+        ));
+    }
+    Ok((
+        initial_demux - from_demux,
+        initial_compression - from_compression,
+    ))
+}
+
 fn report_thread_allocation(thread_plan: ThreadPlan, output_mode: ResolvedOutputMode) {
     if thread_plan.requested_threads < 2 {
         return;
@@ -742,21 +1626,32 @@ fn report_thread_allocation(thread_plan: ThreadPlan, output_mode: ResolvedOutput
             thread_plan.budget_overcommit,
         ),
         ResolvedOutputMode::Buffered => {
-            let (demux, compression) = split_worker_slots(thread_plan.initial_worker_threads);
+            let worker_threads = thread_plan.initial_worker_threads;
+            let dedicated = dedicated_accumulator_worker_slots(worker_threads).ok();
+            let (demux, compression, accumulator, coordinator) =
+                if let Some((demux, compression)) = dedicated {
+                    (demux, compression, 1, "ordered")
+                } else {
+                    let (demux, compression) = split_worker_slots(worker_threads);
+                    (demux, compression, 0, "ordered+accumulator")
+                };
             let overcommit = thread_plan
                 .parser_threads
                 .saturating_add(thread_plan.initial_input_threads)
                 .saturating_add(demux)
                 .saturating_add(compression)
+                .saturating_add(accumulator)
                 .saturating_sub(thread_plan.requested_threads)
                 .max(thread_plan.budget_overcommit);
             eprintln!(
-                "Thread allocation: budget={} fastq-parsing={} input-decompression={} demux={} compression={} overcommit={}",
+                "Thread allocation: budget={} fastq-parsing={} input-decompression={} demux={} accumulator={} compression={} coordinator={} writer=1 infrastructure-threads=2 overcommit={}",
                 thread_plan.requested_threads,
                 thread_plan.parser_threads,
                 thread_plan.initial_input_threads,
                 demux,
+                accumulator,
                 compression,
+                coordinator,
                 overcommit,
             );
         }
@@ -1098,6 +1993,10 @@ fn run_cram_output_serial(
 impl StageGates {
     fn new(total: usize, control: PipelineControl) -> Self {
         let (demux, compression) = split_worker_slots(total);
+        Self::new_exact(demux, compression, control)
+    }
+
+    fn new_exact(demux: usize, compression: usize, control: PipelineControl) -> Self {
         Self {
             demux: WorkerGate::new(demux, control.clone()),
             compression: WorkerGate::new(compression, control),
@@ -1310,12 +2209,22 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
     }
 
     let available_memory = available_memory_bytes().unwrap_or(512 * 1024 * 1024);
-    let output_policy = calculate_output_buffer_policy(
-        expected_streams,
-        available_memory,
-        args.output_chunk_size.explicit_bytes(),
-        args.output_buffer_memory.explicit_bytes(),
-    )?;
+    let input_is_fastq = matches!(&input, InputSource::Fastq(_));
+    let output_policy = if input_is_fastq {
+        calculate_fastq_output_buffer_policy(
+            expected_streams,
+            available_memory,
+            args.output_chunk_size.explicit_bytes(),
+            args.output_buffer_memory.explicit_bytes(),
+        )?
+    } else {
+        calculate_output_buffer_policy(
+            expected_streams,
+            available_memory,
+            args.output_chunk_size.explicit_bytes(),
+            args.output_buffer_memory.explicit_bytes(),
+        )?
+    };
     eprintln!(
         "Output buffering: streams={} chunk={} bytes budget={} bytes max-open-files={}",
         output_policy.expected_streams,
@@ -1333,17 +2242,32 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
         max_open_files,
         args.compression_level,
     )?;
-    let accumulator = OutputAccumulator::new(
-        output_layout,
-        output_policy.chunk_size,
-        output_policy.memory_budget,
-    )?;
     let run_marker = OutputRunMarker::begin(&output_dir)?;
 
     let queue_capacity = worker_threads
         .checked_mul(QUEUE_DEPTH_PER_WORKER)
         .ok_or("Worker queue capacity overflow")?
         .clamp(1, MAX_QUEUED_BATCHES);
+    // Buffered FASTQ uses a fixed stage allocation. The accumulator owns one
+    // worker slot when the budget can still retain routing and compression;
+    // smaller budgets combine ordering and accumulation. CRAM-to-FASTQ retains
+    // its established adaptive combined-stage behavior.
+    let fixed_buffered_workers = input_is_fastq;
+    let dedicated_accumulator =
+        input_is_fastq && dedicated_accumulator_worker_slots(worker_threads).is_ok();
+    let ready_queue_factor = if input_is_fastq {
+        FASTQ_READY_QUEUE_FACTOR
+    } else {
+        1
+    };
+    let credit_factor = if input_is_fastq {
+        FASTQ_CREDIT_FACTOR
+    } else {
+        1
+    };
+    let compression_queue_capacity = queue_capacity
+        .checked_mul(ready_queue_factor)
+        .ok_or("Compression-ready queue capacity overflow")?;
 
     let (work_tx, work_rx) = bounded::<WorkBatch>(queue_capacity);
     let (result_tx, result_rx) = bounded::<ProcessedBatch>(queue_capacity);
@@ -1356,38 +2280,95 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
             .send(())
             .map_err(|_| "Could not initialize batch permits")?;
     }
-    let (compression_tx, compression_rx) = bounded::<QueuedCompressionJob>(queue_capacity);
+    let (compression_tx, compression_rx) =
+        bounded::<QueuedCompressionJob>(compression_queue_capacity);
     let (compressed_tx, compressed_rx) = bounded::<CompressedChunk>(queue_capacity);
-    let outstanding_limit = compression_outstanding_limit(
+    let base_outstanding_limit = compression_outstanding_limit(
         queue_capacity,
         output_policy.chunk_size,
         output_policy.memory_budget,
     )?;
+    let outstanding_limit = base_outstanding_limit
+        .checked_mul(credit_factor)
+        .ok_or("Outstanding compression credit limit overflow")?
+        .min((output_policy.memory_budget / output_policy.chunk_size).max(1));
     let (permit_tx, permit_rx) = bounded::<()>(outstanding_limit);
     for _ in 0..outstanding_limit {
         permit_tx
             .send(())
             .map_err(|_| "Could not initialize compression permits")?;
     }
-    let stage_gates = StageGates::new(worker_threads, control.clone());
-    let allocation_controller = thread_plan.adaptive_allocation().map(|allocation| {
-        AllocationController::new_split(
-            allocation,
-            parallel_input.clone(),
-            stage_gates.clone(),
+    if input_is_fastq {
+        eprintln!(
+            "Buffered FASTQ reservoir: ready-queue={} compression-credits={}",
+            compression_queue_capacity, outstanding_limit,
+        );
+    }
+    let spawned_worker_threads = if fixed_buffered_workers {
+        worker_threads
+    } else {
+        worker_headroom
+    };
+    let (demux_headroom, compression_headroom) = if dedicated_accumulator {
+        dedicated_accumulator_worker_slots(spawned_worker_threads)?
+    } else {
+        split_worker_slots(spawned_worker_threads)
+    };
+    let stage_gates = if fixed_buffered_workers {
+        StageGates::new_exact(demux_headroom, compression_headroom, control.clone())
+    } else {
+        StageGates::new(worker_threads, control.clone())
+    };
+    let allocation_controller = if fixed_buffered_workers {
+        None
+    } else {
+        thread_plan.adaptive_allocation().map(|allocation| {
+            AllocationController::new_split(
+                allocation,
+                parallel_input.clone(),
+                stage_gates.clone(),
+                queue_capacity,
+            )
+        })
+    };
+    let accumulator = if !dedicated_accumulator {
+        Some(OutputAccumulator::new(
+            output_layout,
+            output_policy.chunk_size,
+            output_policy.memory_budget,
+        )?)
+    } else {
+        None
+    };
+    let buffered_telemetry = if validation_switch_enabled(BUFFERED_TELEMETRY_ENV) {
+        Some(BufferedTelemetry::new(
             queue_capacity,
-        )
-    });
-    let (demux_headroom, compression_headroom) = split_worker_slots(worker_headroom);
+            compression_queue_capacity,
+            queue_capacity,
+            outstanding_limit,
+            output_policy.memory_budget,
+            expected_streams,
+            compression_headroom,
+        ))
+    } else {
+        None
+    };
     let compression_level = args.compression_level;
     let sample_count = samples.samples.len();
 
     let pipeline_result = thread::scope(|scope| {
         stage_boundary(&control, "Buffered pipeline coordinator", || {
             let writer_control = control.clone();
+            let writer_telemetry = buffered_telemetry.clone();
             let writer_handle = scope.spawn(move || {
                 stage_boundary(&writer_control, "Output writer thread", || {
-                    writer_loop(writer, &compressed_rx, output_layout, &writer_control)
+                    writer_loop(
+                        writer,
+                        &compressed_rx,
+                        output_layout,
+                        &writer_control,
+                        writer_telemetry.as_deref(),
+                    )
                 })
             });
 
@@ -1397,6 +2378,7 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
                 let sender = compressed_tx.clone();
                 let gate = stage_gates.compression.clone();
                 let worker_control = control.clone();
+                let worker_telemetry = buffered_telemetry.clone();
                 compression_handles.push(scope.spawn(move || {
                     stage_boundary(
                         &worker_control,
@@ -1409,6 +2391,7 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
                                 compression_level,
                                 gate,
                                 &worker_control,
+                                worker_telemetry.as_deref(),
                             )
                         },
                     )
@@ -1419,18 +2402,37 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
 
             let aggregator_control = control.clone();
             let compression_permit_returns = permit_tx.clone();
+            let aggregator_telemetry = buffered_telemetry.clone();
             let aggregator_handle = scope.spawn(move || {
                 stage_boundary(&aggregator_control, "Output aggregator thread", || {
-                    aggregation_loop(
-                        &result_rx,
-                        &compression_tx,
-                        &permit_rx,
-                        &compression_permit_returns,
-                        accumulator,
-                        sample_count,
-                        paired,
-                        &aggregator_control,
-                    )
+                    if dedicated_accumulator {
+                        dedicated_aggregation_loop(
+                            &result_rx,
+                            &compression_tx,
+                            &permit_rx,
+                            &compression_permit_returns,
+                            output_layout,
+                            output_policy.chunk_size,
+                            output_policy.memory_budget,
+                            queue_capacity,
+                            sample_count,
+                            paired,
+                            &aggregator_control,
+                            aggregator_telemetry.as_deref(),
+                        )
+                    } else {
+                        aggregation_loop(
+                            &result_rx,
+                            &compression_tx,
+                            &permit_rx,
+                            &compression_permit_returns,
+                            accumulator.ok_or("Output accumulator is missing")?,
+                            sample_count,
+                            paired,
+                            &aggregator_control,
+                            aggregator_telemetry.as_deref(),
+                        )
+                    }
                 })
             });
 
@@ -1441,6 +2443,7 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
                 let worker_state = &state;
                 let gate = stage_gates.demux.clone();
                 let worker_control = control.clone();
+                let worker_telemetry = buffered_telemetry.clone();
                 worker_handles.push(scope.spawn(move || {
                     stage_boundary(
                         &worker_control,
@@ -1453,6 +2456,7 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
                                 worker_state,
                                 gate,
                                 &worker_control,
+                                worker_telemetry.as_deref(),
                             )
                         },
                     )
@@ -1475,14 +2479,14 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
             };
 
             let producer_result = stage_boundary(&control, "Input producer", || match &input {
-                InputSource::Fastq(InputFiles::Single(path)) => produce_single(
+                InputSource::Fastq(InputFiles::Single(path)) => produce_batch_owned_single(
                     path,
                     &mut batcher,
                     r1_stats.as_mut(),
                     &parallel_input,
                     &control,
                 ),
-                InputSource::Fastq(InputFiles::Paired { r1, r2 }) => produce_paired(
+                InputSource::Fastq(InputFiles::Paired { r1, r2 }) => produce_batch_owned_paired(
                     r1,
                     r2,
                     &mut batcher,
@@ -1512,9 +2516,11 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
 
             let gate_result = if control.is_cancelled() {
                 Err(control.root_error())
+            } else if fixed_buffered_workers {
+                Ok(())
             } else {
                 stage_boundary(&control, "Worker gate finalization", || {
-                    stage_gates.set_total(worker_headroom)
+                    stage_gates.set_total(spawned_worker_threads)
                 })
             };
 
@@ -1583,6 +2589,9 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
     });
 
     let (aggregation, writer_result) = pipeline_result?;
+    if let Some(telemetry) = &buffered_telemetry {
+        telemetry.report();
+    }
     let counts = aggregation.counts;
     aggregation.sample_qc.verify(counts.assigned)?;
     verify_unassigned_output_counts(
@@ -2082,7 +3091,15 @@ fn cram_worker_loop(
 }
 
 fn process_cram_batch(batch: WorkBatch, state: &SharedState) -> Result<CramProcessedBatch, String> {
-    let WorkBatch { id, items, permit } = batch;
+    let WorkBatch {
+        id,
+        items,
+        fastq_backings,
+        permit,
+    } = batch;
+    if !fastq_backings.is_empty() {
+        return Err("Internal error: FASTQ backing storage reached CRAM output adapter".into());
+    }
     let mut outputs = Vec::with_capacity(items.len());
     let mut counts = DemuxCounts::default();
     for item in items {
@@ -2129,7 +3146,12 @@ fn process_cram_batch(batch: WorkBatch, state: &SharedState) -> Result<CramProce
                     });
                 }
             }
-            WorkItem::Single(_) | WorkItem::Pair { .. } | WorkItem::Orphan { .. } => {
+            WorkItem::Single(_)
+            | WorkItem::Pair { .. }
+            | WorkItem::Orphan { .. }
+            | WorkItem::BatchSingle(_)
+            | WorkItem::BatchPair { .. }
+            | WorkItem::BatchOrphan { .. } => {
                 return Err("Internal error: FASTQ work reached CRAM output adapter".into());
             }
         }
@@ -2537,9 +3559,14 @@ fn process_direct_batch(
     let ProcessedBatch {
         id,
         outputs,
+        referenced_outputs,
+        fastq_backings,
         counts,
         permit,
     } = processed;
+    if !referenced_outputs.is_empty() || !fastq_backings.is_empty() {
+        return Err("Internal error: batch-owned FASTQ reached direct output adapter".into());
+    }
     let outputs = outputs
         .into_iter()
         .map(|output| {
@@ -2665,6 +3692,7 @@ fn worker_loop(
     state: &SharedState,
     gate: WorkerGate,
     control: &PipelineControl,
+    telemetry: Option<&BufferedTelemetry>,
 ) -> Result<(), String> {
     loop {
         gate.wait_until_active(worker_index)?;
@@ -2680,18 +3708,38 @@ fn worker_loop(
                 process_batch(batch, state)
             },
         )?;
+        let send_started = telemetry.map(|_| Instant::now());
+        if let Some(telemetry) = telemetry
+            && sender.is_full()
+        {
+            telemetry.routing_send_full.fetch_add(1, Ordering::Relaxed);
+        }
         send_or_cancel(
             sender,
             processed,
             control,
             "Processed batch queue disconnected",
         )?;
+        if let Some(telemetry) = telemetry {
+            telemetry.routing_batches.fetch_add(1, Ordering::Relaxed);
+            telemetry.routing_send_ns.fetch_add(
+                elapsed_ns(send_started.expect("telemetry start must exist")),
+                Ordering::Relaxed,
+            );
+            BufferedTelemetry::observe_queue(&telemetry.result_queue, sender.len());
+        }
     }
 }
 
 fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch, String> {
-    let WorkBatch { id, items, permit } = batch;
+    let WorkBatch {
+        id,
+        items,
+        fastq_backings,
+        permit,
+    } = batch;
     let mut buffers = BatchBuffers::new(state.output_layout)?;
+    let mut referenced_outputs = Vec::with_capacity(items.len().saturating_mul(2));
     let mut counts = DemuxCounts::default();
 
     for item in items {
@@ -2715,6 +3763,63 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
                     buffers.push_record(OutputTarget::Unassigned, mate, &record, 0)?;
                 }
             }
+            WorkItem::BatchSingle(record) => {
+                let view = resolve_batch_record(&fastq_backings, record)?;
+                let (target, trim_start) = route_single_parts(view.seq, state, &mut counts)?;
+                if should_emit(target, state.write_unassigned) {
+                    referenced_outputs.push(ReferencedOutput {
+                        key: OutputKey {
+                            target,
+                            mate: OutputMate::Single,
+                        },
+                        record,
+                        trim_start,
+                    });
+                }
+            }
+            WorkItem::BatchPair { r1, r2 } => {
+                let r1_view = resolve_batch_record(&fastq_backings, r1)?;
+                let r2_view = resolve_batch_record(&fastq_backings, r2)?;
+                let (target, r1_trim, r2_trim) =
+                    route_pair_parts(r1_view.seq, r2_view.seq, state, &mut counts)?;
+                if should_emit(target, state.write_unassigned) {
+                    referenced_outputs.push(ReferencedOutput {
+                        key: OutputKey {
+                            target,
+                            mate: OutputMate::R1,
+                        },
+                        record: r1,
+                        trim_start: r1_trim,
+                    });
+                    referenced_outputs.push(ReferencedOutput {
+                        key: OutputKey {
+                            target,
+                            mate: OutputMate::R2,
+                        },
+                        record: r2,
+                        trim_start: r2_trim,
+                    });
+                }
+            }
+            WorkItem::BatchOrphan { mate, record } => {
+                match mate {
+                    OutputMate::R1 => counts.orphan_r1 += 1,
+                    OutputMate::R2 => counts.orphan_r2 += 1,
+                    OutputMate::Single => {
+                        return Err("Internal error: paired orphan cannot be single-end".into());
+                    }
+                }
+                if state.write_unassigned {
+                    referenced_outputs.push(ReferencedOutput {
+                        key: OutputKey {
+                            target: OutputTarget::Unassigned,
+                            mate,
+                        },
+                        record,
+                        trim_start: 0,
+                    });
+                }
+            }
             WorkItem::CramSingle(_) | WorkItem::CramPair { .. } | WorkItem::CramOrphan { .. } => {
                 return Err("Internal error: CRAM work reached FASTQ output adapter".into());
             }
@@ -2726,9 +3831,22 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
     Ok(ProcessedBatch {
         id,
         outputs,
+        referenced_outputs,
+        fastq_backings,
         counts,
         permit,
     })
+}
+
+fn resolve_batch_record(
+    backings: &[Arc<FastqReadBlock>],
+    record: BatchFastqRecordRef,
+) -> Result<FastqReadView<'_>, String> {
+    let block = usize::try_from(record.block).map_err(|_| "Invalid FASTQ backing index")?;
+    backings
+        .get(block)
+        .ok_or("FASTQ record references a missing backing block")?
+        .record(record.record)
 }
 
 fn process_single_record(
@@ -2768,7 +3886,15 @@ fn route_single_record(
     state: &SharedState,
     counts: &mut DemuxCounts,
 ) -> Result<(OutputTarget, usize), String> {
-    let route = if let Some(route) = state.routing.route_read(&record.seq, None)? {
+    route_single_parts(&record.seq, state, counts)
+}
+
+fn route_single_parts(
+    seq: &[u8],
+    state: &SharedState,
+    counts: &mut DemuxCounts,
+) -> Result<(OutputTarget, usize), String> {
+    let route = if let Some(route) = state.routing.route_read(seq, None)? {
         route
     } else {
         counts.short_reads += 1;
@@ -2783,7 +3909,16 @@ fn route_pair_records(
     state: &SharedState,
     counts: &mut DemuxCounts,
 ) -> Result<(OutputTarget, usize, usize), String> {
-    let route = if let Some(route) = state.routing.route_read(&r1.seq, Some(&r2.seq))? {
+    route_pair_parts(&r1.seq, &r2.seq, state, counts)
+}
+
+fn route_pair_parts(
+    r1_seq: &[u8],
+    r2_seq: &[u8],
+    state: &SharedState,
+    counts: &mut DemuxCounts,
+) -> Result<(OutputTarget, usize, usize), String> {
+    let route = if let Some(route) = state.routing.route_read(r1_seq, Some(r2_seq))? {
         route
     } else {
         counts.short_reads += 1;
@@ -2834,26 +3969,134 @@ fn route_to_target(route: RouteResult, counts: &mut DemuxCounts) -> OutputTarget
 }
 
 #[allow(clippy::too_many_arguments)]
-fn aggregation_loop(
+fn dedicated_aggregation_loop(
     receiver: &Receiver<ProcessedBatch>,
-    sender: &Sender<QueuedCompressionJob>,
+    compression_sender: &Sender<QueuedCompressionJob>,
     permits: &Receiver<()>,
     permit_returns: &Sender<()>,
-    mut accumulator: OutputAccumulator,
+    layout: OutputLayout,
+    chunk_size: usize,
+    memory_budget: usize,
+    queue_capacity: usize,
     sample_count: usize,
     paired: bool,
     control: &PipelineControl,
+    telemetry: Option<&BufferedTelemetry>,
 ) -> Result<AggregationResult, String> {
+    thread::scope(|scope| {
+        let (accumulator_sender, accumulator_receiver) =
+            bounded::<AccumulatorBatch>(queue_capacity);
+        let accumulator_control = control.clone();
+        let accumulator_handle = scope.spawn(move || {
+            stage_boundary(&accumulator_control, "Output accumulator", || {
+                accumulator_loop(
+                    &accumulator_receiver,
+                    compression_sender,
+                    permits,
+                    permit_returns,
+                    layout,
+                    chunk_size,
+                    memory_budget,
+                    &accumulator_control,
+                    telemetry,
+                )
+            })
+        });
+
+        let coordinator_result = ordered_coordinator_loop(
+            receiver,
+            &accumulator_sender,
+            layout,
+            sample_count,
+            paired,
+            control,
+            telemetry,
+        );
+        drop(accumulator_sender);
+        let accumulator_result = match accumulator_handle.join() {
+            Ok(result) => result,
+            Err(payload) => Err(control.fail(format!(
+                "Output accumulator boundary panicked: {}",
+                panic_payload(payload)
+            ))),
+        };
+
+        if let Some(error) = control.first_error() {
+            return Err(error);
+        }
+        let (mut result, mut combined_metrics) = coordinator_result?;
+        let accumulator_result = accumulator_result?;
+        result.chunks = accumulator_result.chunks;
+        result.uncompressed_bytes = accumulator_result.uncompressed_bytes;
+        if telemetry.is_some() {
+            eprintln!(
+                "Buffered telemetry accumulator: elapsed_s={:.6} receive_wait_s={:.6} handle_s={:.6} append_s={:.6} fragments={} jobs={} buffered_bytes_peak_upper_bound={}",
+                accumulator_result.telemetry.elapsed_ns as f64 / 1e9,
+                accumulator_result.telemetry.receive_wait_ns as f64 / 1e9,
+                accumulator_result.telemetry.handle_ns as f64 / 1e9,
+                accumulator_result.telemetry.append_ns as f64 / 1e9,
+                accumulator_result.telemetry.fragments,
+                accumulator_result.telemetry.jobs,
+                accumulator_result.telemetry.buffered_bytes_max,
+            );
+        }
+        combined_metrics.merge_accumulator(accumulator_result.telemetry);
+        combined_metrics.elapsed_ns =
+            elapsed_ns(telemetry.map_or_else(Instant::now, |telemetry| telemetry.started));
+        if let Some(telemetry) = telemetry {
+            *telemetry
+                .aggregation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(combined_metrics);
+        }
+        Ok(result)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ordered_coordinator_loop(
+    receiver: &Receiver<ProcessedBatch>,
+    accumulator_sender: &Sender<AccumulatorBatch>,
+    layout: OutputLayout,
+    sample_count: usize,
+    paired: bool,
+    control: &PipelineControl,
+    telemetry: Option<&BufferedTelemetry>,
+) -> Result<(AggregationResult, AggregationTelemetry), String> {
     let mut pending = BTreeMap::<u64, ProcessedBatch>::new();
     let mut next_batch_id = 0u64;
     let mut counts = DemuxCounts::default();
     let mut sample_qc = SampleQc::new(sample_count, paired);
-    let mut chunks = 0u64;
-    let mut uncompressed_bytes = 0u64;
     let mut unassigned_records = 0u64;
+    let mut metrics = telemetry
+        .and_then(|telemetry| {
+            telemetry
+                .aggregation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        })
+        .unwrap_or_else(|| AggregationTelemetry::new(layout.stream_count().unwrap_or(0)));
 
-    while let Some(batch) = recv_or_cancel(receiver, control)? {
+    loop {
+        let receive_started = telemetry.map(|_| Instant::now());
+        let waiting_for_ordered_gap = !pending.is_empty() && !pending.contains_key(&next_batch_id);
+        let received = recv_or_cancel(receiver, control)?;
+        if telemetry.is_some() {
+            let waited = elapsed_ns(receive_started.expect("telemetry start must exist"));
+            metrics.receive_wait_ns = metrics.receive_wait_ns.saturating_add(waited);
+            if waiting_for_ordered_gap {
+                metrics.ordered_gap_wait_ns = metrics.ordered_gap_wait_ns.saturating_add(waited);
+            }
+        }
+        if let Some(telemetry) = telemetry {
+            BufferedTelemetry::observe_queue(&telemetry.result_queue, receiver.len());
+        }
+        let Some(batch) = received else {
+            break;
+        };
         let received_batch_id = batch.id;
+        let handle_started = telemetry.map(|_| Instant::now());
         stage_boundary(
             control,
             &format!("Output aggregator while handling batch {received_batch_id}"),
@@ -2864,8 +4107,334 @@ fn aggregation_loop(
                 {
                     return Err("Duplicate or stale processed batch ID".into());
                 }
+                Ok(())
+            },
+        )?;
+        metrics.batches = metrics.batches.saturating_add(1);
+        if received_batch_id != next_batch_id {
+            metrics.out_of_order_arrivals = metrics.out_of_order_arrivals.saturating_add(1);
+        }
+        metrics.observe_reorder_depth(pending.len());
+
+        while let Some(batch) = pending.remove(&next_batch_id) {
+            let ProcessedBatch {
+                outputs,
+                referenced_outputs,
+                fastq_backings,
+                counts: batch_counts,
+                permit,
+                ..
+            } = batch;
+            for output in &outputs {
+                control.check()?;
+                observe_output_metrics(
+                    output.key,
+                    output.records,
+                    output.bases,
+                    &mut sample_qc,
+                    &mut unassigned_records,
+                )?;
+            }
+            for output in &referenced_outputs {
+                let record = resolve_batch_record(&fastq_backings, output.record)?;
+                let seq = record
+                    .seq
+                    .get(output.trim_start..)
+                    .ok_or("Internal error: trim prefix exceeds FASTQ sequence length")?;
+                let qual = record
+                    .qual
+                    .get(output.trim_start..)
+                    .ok_or("Internal error: trim prefix exceeds FASTQ quality length")?;
+                if seq.len() != qual.len() {
+                    return Err("Sequence and quality lengths do not match".into());
+                }
+                observe_output_metrics(
+                    output.key,
+                    1,
+                    u64::try_from(seq.len()).map_err(|_| "Read length overflow")?,
+                    &mut sample_qc,
+                    &mut unassigned_records,
+                )?;
+            }
+            send_or_cancel(
+                accumulator_sender,
+                AccumulatorBatch {
+                    batch_id: next_batch_id,
+                    outputs,
+                    referenced_outputs,
+                    fastq_backings,
+                },
+                control,
+                "Accumulator queue disconnected",
+            )?;
+            counts.merge(&batch_counts);
+            drop(permit);
+            next_batch_id = next_batch_id.checked_add(1).ok_or("Batch ID overflow")?;
+        }
+        if telemetry.is_some() {
+            metrics.handle_ns = metrics.handle_ns.saturating_add(elapsed_ns(
+                handle_started.expect("telemetry start must exist"),
+            ));
+        }
+    }
+
+    if !pending.is_empty() {
+        return Err(format!(
+            "Parallel output ended with a missing batch before batch {next_batch_id}"
+        ));
+    }
+    Ok((
+        AggregationResult {
+            counts,
+            sample_qc,
+            batches: next_batch_id,
+            chunks: 0,
+            uncompressed_bytes: 0,
+            unassigned_records,
+        },
+        metrics,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulator_loop(
+    receiver: &Receiver<AccumulatorBatch>,
+    compression_sender: &Sender<QueuedCompressionJob>,
+    permits: &Receiver<()>,
+    permit_returns: &Sender<()>,
+    layout: OutputLayout,
+    chunk_size: usize,
+    memory_budget: usize,
+    control: &PipelineControl,
+    telemetry: Option<&BufferedTelemetry>,
+) -> Result<AccumulatorResult, String> {
+    let started = Instant::now();
+    let pipeline_started = telemetry.map_or(started, |telemetry| telemetry.started);
+    let mut metrics = AggregationTelemetry::new(layout.stream_count()?);
+    let mut accumulator = OutputAccumulator::new(layout, chunk_size, memory_budget)?;
+    let mut chunks = 0u64;
+    let mut uncompressed_bytes = 0u64;
+    let mut last_batch_id = None;
+
+    loop {
+        let receive_started = telemetry.map(|_| Instant::now());
+        let received = recv_or_cancel(receiver, control)?;
+        if telemetry.is_some() {
+            metrics.receive_wait_ns = metrics.receive_wait_ns.saturating_add(elapsed_ns(
+                receive_started.expect("telemetry start must exist"),
+            ));
+        }
+        let Some(batch) = received else {
+            break;
+        };
+        inject_test_failure("accumulator", batch.batch_id)?;
+        if last_batch_id.is_some_and(|previous| batch.batch_id <= previous) {
+            return Err(format!(
+                "Output accumulator received non-monotonic batch {}",
+                batch.batch_id,
+            ));
+        }
+        last_batch_id = Some(batch.batch_id);
+        let handle_started = telemetry.map(|_| Instant::now());
+        let chunks_before_batch = chunks;
+        for output in batch.outputs {
+            control.check()?;
+            if telemetry.is_some() {
+                metrics.fragments = metrics.fragments.saturating_add(1);
+                metrics.records = metrics.records.saturating_add(output.records);
+                metrics.bytes = metrics
+                    .bytes
+                    .saturating_add(u64::try_from(output.fastq.len()).unwrap_or(u64::MAX));
+            }
+            let append_started = telemetry.map(|_| Instant::now());
+            let jobs = accumulator.append(output.key, output.fastq)?;
+            let pressure_event = jobs
+                .iter()
+                .any(|job| job.flush_reason == CompressionFlushReason::MemoryPressure);
+            if telemetry.is_some() {
+                metrics.append_ns = metrics.append_ns.saturating_add(elapsed_ns(
+                    append_started.expect("telemetry start must exist"),
+                ));
+                if pressure_event {
+                    metrics.memory_pressure_events =
+                        metrics.memory_pressure_events.saturating_add(1);
+                }
+                metrics.active_buffers_max =
+                    metrics.active_buffers_max.max(accumulator.active_buffers());
+                metrics.buffered_bytes_max =
+                    metrics.buffered_bytes_max.max(accumulator.buffered_bytes());
+            }
+            send_compression_jobs(
+                compression_sender,
+                permits,
+                permit_returns,
+                jobs,
+                &mut chunks,
+                &mut uncompressed_bytes,
+                control,
+                telemetry.map(|_| &mut metrics),
+                telemetry,
+                layout,
+                pipeline_started,
+            )?;
+        }
+        for output in batch.referenced_outputs {
+            control.check()?;
+            let record = resolve_batch_record(&batch.fastq_backings, output.record)?;
+            let seq = record
+                .seq
+                .get(output.trim_start..)
+                .ok_or("Internal error: trim prefix exceeds FASTQ sequence length")?;
+            let qual = record
+                .qual
+                .get(output.trim_start..)
+                .ok_or("Internal error: trim prefix exceeds FASTQ quality length")?;
+            if seq.len() != qual.len() {
+                return Err("Sequence and quality lengths do not match".into());
+            }
+            if telemetry.is_some() {
+                metrics.fragments = metrics.fragments.saturating_add(1);
+                metrics.records = metrics.records.saturating_add(1);
+                let fastq_len = serialized_fastq_len(record.id, seq, qual)?;
+                metrics.bytes = metrics
+                    .bytes
+                    .saturating_add(u64::try_from(fastq_len).unwrap_or(u64::MAX));
+            }
+            let append_started = telemetry.map(|_| Instant::now());
+            let jobs = accumulator.append_record(output.key, record.id, seq, qual)?;
+            let pressure_event = jobs
+                .iter()
+                .any(|job| job.flush_reason == CompressionFlushReason::MemoryPressure);
+            if telemetry.is_some() {
+                metrics.append_ns = metrics.append_ns.saturating_add(elapsed_ns(
+                    append_started.expect("telemetry start must exist"),
+                ));
+                if pressure_event {
+                    metrics.memory_pressure_events =
+                        metrics.memory_pressure_events.saturating_add(1);
+                }
+                metrics.active_buffers_max =
+                    metrics.active_buffers_max.max(accumulator.active_buffers());
+                metrics.buffered_bytes_max =
+                    metrics.buffered_bytes_max.max(accumulator.buffered_bytes());
+            }
+            send_compression_jobs(
+                compression_sender,
+                permits,
+                permit_returns,
+                jobs,
+                &mut chunks,
+                &mut uncompressed_bytes,
+                control,
+                telemetry.map(|_| &mut metrics),
+                telemetry,
+                layout,
+                pipeline_started,
+            )?;
+        }
+        if telemetry.is_some() {
+            metrics.observe_batch_jobs(chunks.saturating_sub(chunks_before_batch));
+        }
+        if telemetry.is_some() {
+            metrics.handle_ns = metrics.handle_ns.saturating_add(elapsed_ns(
+                handle_started.expect("telemetry start must exist"),
+            ));
+        }
+    }
+
+    let final_jobs = accumulator.finish()?;
+    send_compression_jobs(
+        compression_sender,
+        permits,
+        permit_returns,
+        final_jobs,
+        &mut chunks,
+        &mut uncompressed_bytes,
+        control,
+        telemetry.map(|_| &mut metrics),
+        telemetry,
+        layout,
+        pipeline_started,
+    )?;
+    metrics.elapsed_ns = elapsed_ns(started);
+    Ok(AccumulatorResult {
+        chunks,
+        uncompressed_bytes,
+        telemetry: metrics,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregation_loop(
+    receiver: &Receiver<ProcessedBatch>,
+    sender: &Sender<QueuedCompressionJob>,
+    permits: &Receiver<()>,
+    permit_returns: &Sender<()>,
+    mut accumulator: OutputAccumulator,
+    sample_count: usize,
+    paired: bool,
+    control: &PipelineControl,
+    telemetry: Option<&BufferedTelemetry>,
+) -> Result<AggregationResult, String> {
+    let layout = accumulator.layout();
+    let mut pending = BTreeMap::<u64, ProcessedBatch>::new();
+    let mut next_batch_id = 0u64;
+    let mut counts = DemuxCounts::default();
+    let mut sample_qc = SampleQc::new(sample_count, paired);
+    let mut chunks = 0u64;
+    let mut uncompressed_bytes = 0u64;
+    let mut unassigned_records = 0u64;
+    let pipeline_started = telemetry.map_or_else(Instant::now, |telemetry| telemetry.started);
+    let mut metrics = telemetry.and_then(|telemetry| {
+        telemetry
+            .aggregation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    });
+
+    loop {
+        let receive_started = telemetry.map(|_| Instant::now());
+        let waiting_for_ordered_gap = !pending.is_empty() && !pending.contains_key(&next_batch_id);
+        let received = recv_or_cancel(receiver, control)?;
+        if let Some(metrics) = metrics.as_mut() {
+            let waited = elapsed_ns(receive_started.expect("telemetry start must exist"));
+            metrics.receive_wait_ns = metrics.receive_wait_ns.saturating_add(waited);
+            if waiting_for_ordered_gap {
+                metrics.ordered_gap_wait_ns = metrics.ordered_gap_wait_ns.saturating_add(waited);
+            }
+        }
+        if let Some(telemetry) = telemetry {
+            BufferedTelemetry::observe_queue(&telemetry.result_queue, receiver.len());
+        }
+        let Some(batch) = received else {
+            break;
+        };
+        let received_batch_id = batch.id;
+        let handle_started = telemetry.map(|_| Instant::now());
+        stage_boundary(
+            control,
+            &format!("Output aggregator while handling batch {received_batch_id}"),
+            || {
+                inject_test_failure("aggregation", received_batch_id)?;
+                if let Some(metrics) = metrics.as_mut() {
+                    metrics.batches = metrics.batches.saturating_add(1);
+                    if received_batch_id != next_batch_id {
+                        metrics.out_of_order_arrivals =
+                            metrics.out_of_order_arrivals.saturating_add(1);
+                    }
+                }
+                if received_batch_id < next_batch_id
+                    || pending.insert(received_batch_id, batch).is_some()
+                {
+                    return Err("Duplicate or stale processed batch ID".into());
+                }
+                if let Some(metrics) = metrics.as_mut() {
+                    metrics.observe_reorder_depth(pending.len());
+                }
 
                 while let Some(batch) = pending.remove(&next_batch_id) {
+                    let chunks_before_batch = chunks;
                     aggregate_processed_batch(
                         batch,
                         &mut accumulator,
@@ -2878,12 +4447,24 @@ fn aggregation_loop(
                         &mut uncompressed_bytes,
                         &mut unassigned_records,
                         control,
+                        metrics.as_mut(),
+                        telemetry,
+                        layout,
+                        pipeline_started,
                     )?;
+                    if let Some(metrics) = metrics.as_mut() {
+                        metrics.observe_batch_jobs(chunks.saturating_sub(chunks_before_batch));
+                    }
                     next_batch_id = next_batch_id.checked_add(1).ok_or("Batch ID overflow")?;
                 }
                 Ok(())
             },
         )?;
+        if let Some(metrics) = metrics.as_mut() {
+            metrics.handle_ns = metrics.handle_ns.saturating_add(elapsed_ns(
+                handle_started.expect("telemetry start must exist"),
+            ));
+        }
     }
 
     if !pending.is_empty() {
@@ -2892,15 +4473,28 @@ fn aggregation_loop(
         ));
     }
 
+    let final_jobs = accumulator.finish()?;
     send_compression_jobs(
         sender,
         permits,
         permit_returns,
-        accumulator.finish()?,
+        final_jobs,
         &mut chunks,
         &mut uncompressed_bytes,
         control,
+        metrics.as_mut(),
+        telemetry,
+        layout,
+        pipeline_started,
     )?;
+
+    if let (Some(telemetry), Some(mut metrics)) = (telemetry, metrics) {
+        metrics.elapsed_ns = elapsed_ns(pipeline_started);
+        *telemetry
+            .aggregation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(metrics);
+    }
 
     Ok(AggregationResult {
         counts,
@@ -2925,15 +4519,28 @@ fn aggregate_processed_batch(
     uncompressed_bytes: &mut u64,
     unassigned_records: &mut u64,
     control: &PipelineControl,
+    mut metrics: Option<&mut AggregationTelemetry>,
+    telemetry: Option<&BufferedTelemetry>,
+    layout: OutputLayout,
+    pipeline_started: Instant,
 ) -> Result<(), String> {
     let ProcessedBatch {
         outputs,
+        referenced_outputs,
+        fastq_backings,
         counts: batch_counts,
         permit,
         ..
     } = batch;
     for output in outputs {
         control.check()?;
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.fragments = metrics.fragments.saturating_add(1);
+            metrics.records = metrics.records.saturating_add(output.records);
+            metrics.bytes = metrics
+                .bytes
+                .saturating_add(u64::try_from(output.fastq.len()).unwrap_or(u64::MAX));
+        }
         observe_output_metrics(
             output.key,
             output.records,
@@ -2941,7 +4548,23 @@ fn aggregate_processed_batch(
             sample_qc,
             unassigned_records,
         )?;
+        let append_started = telemetry.map(|_| Instant::now());
         let jobs = accumulator.append(output.key, output.fastq)?;
+        let pressure_event = jobs
+            .iter()
+            .any(|job| job.flush_reason == CompressionFlushReason::MemoryPressure);
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.append_ns = metrics.append_ns.saturating_add(elapsed_ns(
+                append_started.expect("telemetry start must exist"),
+            ));
+            if pressure_event {
+                metrics.memory_pressure_events = metrics.memory_pressure_events.saturating_add(1);
+            }
+            metrics.active_buffers_max =
+                metrics.active_buffers_max.max(accumulator.active_buffers());
+            metrics.buffered_bytes_max =
+                metrics.buffered_bytes_max.max(accumulator.buffered_bytes());
+        }
         send_compression_jobs(
             sender,
             permits,
@@ -2950,6 +4573,69 @@ fn aggregate_processed_batch(
             chunks,
             uncompressed_bytes,
             control,
+            metrics.as_deref_mut(),
+            telemetry,
+            layout,
+            pipeline_started,
+        )?;
+    }
+    for output in referenced_outputs {
+        control.check()?;
+        let record = resolve_batch_record(&fastq_backings, output.record)?;
+        let seq = record
+            .seq
+            .get(output.trim_start..)
+            .ok_or("Internal error: trim prefix exceeds FASTQ sequence length")?;
+        let qual = record
+            .qual
+            .get(output.trim_start..)
+            .ok_or("Internal error: trim prefix exceeds FASTQ quality length")?;
+        if seq.len() != qual.len() {
+            return Err("Sequence and quality lengths do not match".into());
+        }
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.fragments = metrics.fragments.saturating_add(1);
+            metrics.records = metrics.records.saturating_add(1);
+            metrics.bytes = metrics.bytes.saturating_add(
+                u64::try_from(serialized_fastq_len(record.id, seq, qual)?).unwrap_or(u64::MAX),
+            );
+        }
+        observe_output_metrics(
+            output.key,
+            1,
+            u64::try_from(seq.len()).map_err(|_| "Read length overflow")?,
+            sample_qc,
+            unassigned_records,
+        )?;
+        let append_started = telemetry.map(|_| Instant::now());
+        let jobs = accumulator.append_record(output.key, record.id, seq, qual)?;
+        let pressure_event = jobs
+            .iter()
+            .any(|job| job.flush_reason == CompressionFlushReason::MemoryPressure);
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.append_ns = metrics.append_ns.saturating_add(elapsed_ns(
+                append_started.expect("telemetry start must exist"),
+            ));
+            if pressure_event {
+                metrics.memory_pressure_events = metrics.memory_pressure_events.saturating_add(1);
+            }
+            metrics.active_buffers_max =
+                metrics.active_buffers_max.max(accumulator.active_buffers());
+            metrics.buffered_bytes_max =
+                metrics.buffered_bytes_max.max(accumulator.buffered_bytes());
+        }
+        send_compression_jobs(
+            sender,
+            permits,
+            permit_returns,
+            jobs,
+            chunks,
+            uncompressed_bytes,
+            control,
+            metrics.as_deref_mut(),
+            telemetry,
+            layout,
+            pipeline_started,
         )?;
     }
 
@@ -2958,6 +4644,19 @@ fn aggregate_processed_batch(
     Ok(())
 }
 
+fn serialized_fastq_len(id: &[u8], seq: &[u8], qual: &[u8]) -> Result<usize, String> {
+    let id = id.strip_prefix(b"@").unwrap_or(id);
+    1usize
+        .checked_add(id.len())
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(seq.len()))
+        .and_then(|value| value.checked_add(3))
+        .and_then(|value| value.checked_add(qual.len()))
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| "Serialized FASTQ record size overflow".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn send_compression_jobs(
     sender: &Sender<QueuedCompressionJob>,
     permits: &Receiver<()>,
@@ -2966,12 +4665,30 @@ fn send_compression_jobs(
     chunks: &mut u64,
     uncompressed_bytes: &mut u64,
     control: &PipelineControl,
+    mut metrics: Option<&mut AggregationTelemetry>,
+    telemetry: Option<&BufferedTelemetry>,
+    layout: OutputLayout,
+    pipeline_started: Instant,
 ) -> Result<(), String> {
     for job in jobs {
         // A credit is returned only after the writer appends this chunk. This
         // bounds queued raw jobs, compressed results, and reorder buffers as a
         // single end-to-end pool even if one compression task is delayed.
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.observe_job(&job, layout, pipeline_started)?;
+            metrics.credit_acquisitions = metrics.credit_acquisitions.saturating_add(1);
+            if permits.is_empty() {
+                metrics.credit_exhausted = metrics.credit_exhausted.saturating_add(1);
+            }
+        }
+        let credit_started = telemetry.map(|_| Instant::now());
         let permit = acquire_permit(permits, permit_returns, control, "compression")?;
+        if let Some(metrics) = metrics.as_deref_mut() {
+            let waited = elapsed_ns(credit_started.expect("telemetry start must exist"));
+            metrics.credit_wait_ns = metrics.credit_wait_ns.saturating_add(waited);
+            metrics.credit_wait_max_ns = metrics.credit_wait_max_ns.max(waited);
+            metrics.credit_wait_histogram[histogram_bucket(waited, &WAIT_NS_BOUNDS)] += 1;
+        }
         *chunks = chunks
             .checked_add(1)
             .ok_or("Compression job count overflow")?;
@@ -2981,12 +4698,31 @@ fn send_compression_jobs(
                     .map_err(|_| "Uncompressed output size overflow")?,
             )
             .ok_or("Uncompressed output size overflow")?;
+        let queued_at = telemetry.map(|_| Instant::now());
+        let send_started = telemetry.map(|_| Instant::now());
+        if let Some(metrics) = metrics.as_deref_mut()
+            && sender.is_full()
+        {
+            metrics.compression_send_full = metrics.compression_send_full.saturating_add(1);
+        }
         send_or_cancel(
             sender,
-            QueuedCompressionJob { job, permit },
+            QueuedCompressionJob {
+                job,
+                permit,
+                queued_at,
+            },
             control,
             "Compression job queue disconnected",
         )?;
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.compression_send_ns = metrics.compression_send_ns.saturating_add(elapsed_ns(
+                send_started.expect("telemetry start must exist"),
+            ));
+        }
+        if let Some(telemetry) = telemetry {
+            BufferedTelemetry::observe_queue(&telemetry.compression_queue, sender.len());
+        }
     }
     Ok(())
 }
@@ -2998,28 +4734,67 @@ fn compression_loop(
     compression_level: u32,
     gate: WorkerGate,
     control: &PipelineControl,
+    telemetry: Option<&BufferedTelemetry>,
 ) -> Result<(), String> {
     loop {
         gate.wait_until_active(worker_index)?;
+        let receive_started = telemetry.map(|_| Instant::now());
         let Some(queued) = recv_or_cancel(receiver, control)? else {
+            if let Some(telemetry) = telemetry {
+                telemetry.workers[worker_index].receive_wait_ns.fetch_add(
+                    elapsed_ns(receive_started.expect("telemetry start must exist")),
+                    Ordering::Relaxed,
+                );
+            }
             return Ok(());
         };
+        if let Some(telemetry) = telemetry {
+            let worker = &telemetry.workers[worker_index];
+            worker.receive_wait_ns.fetch_add(
+                elapsed_ns(receive_started.expect("telemetry start must exist")),
+                Ordering::Relaxed,
+            );
+            if let Some(queued_at) = queued.queued_at {
+                worker
+                    .ready_queue_wait_ns
+                    .fetch_add(elapsed_ns(queued_at), Ordering::Relaxed);
+            }
+            BufferedTelemetry::observe_queue(&telemetry.compression_queue, receiver.len());
+        }
         let key = queued.job.key;
         let chunk_id = queued.job.chunk_id;
         let context = format!(
             "Compression worker {worker_index} for {} chunk {chunk_id}",
             describe_output_key(key)
         );
-        let chunk = stage_boundary(control, &context, || {
+        let busy_started = telemetry.map(|_| Instant::now());
+        let mut chunk = stage_boundary(control, &context, || {
             inject_test_failure("compression-worker", chunk_id)?;
             compress_job(queued.job, compression_level, queued.permit)
         })?;
+        if let Some(telemetry) = telemetry {
+            let worker = &telemetry.workers[worker_index];
+            worker.jobs.fetch_add(1, Ordering::Relaxed);
+            worker.busy_ns.fetch_add(
+                elapsed_ns(busy_started.expect("telemetry start must exist")),
+                Ordering::Relaxed,
+            );
+            chunk.completed_at = Some(Instant::now());
+        }
+        let send_started = telemetry.map(|_| Instant::now());
         send_or_cancel(
             sender,
             chunk,
             control,
             "Compressed chunk queue disconnected",
         )?;
+        if let Some(telemetry) = telemetry {
+            telemetry.workers[worker_index].send_ns.fetch_add(
+                elapsed_ns(send_started.expect("telemetry start must exist")),
+                Ordering::Relaxed,
+            );
+            BufferedTelemetry::observe_queue(&telemetry.completed_queue, sender.len());
+        }
     }
 }
 
@@ -3041,6 +4816,7 @@ fn compress_job(
         chunk_id: job.chunk_id,
         member,
         uncompressed_len,
+        completed_at: None,
         _permit: permit,
     })
 }
@@ -3056,13 +4832,27 @@ fn writer_loop(
     receiver: &Receiver<CompressedChunk>,
     layout: OutputLayout,
     control: &PipelineControl,
+    telemetry: Option<&BufferedTelemetry>,
 ) -> Result<WriterResult, String> {
     let mut ordering: Vec<OutputOrderState> = (0..layout.stream_count()?)
         .map(|_| OutputOrderState::default())
         .collect();
     let mut result = WriterResult::default();
+    let mut pending_chunks = 0usize;
 
-    while let Some(chunk) = recv_or_cancel(receiver, control)? {
+    loop {
+        let receive_started = telemetry.map(|_| Instant::now());
+        let received = recv_or_cancel(receiver, control)?;
+        if let Some(telemetry) = telemetry {
+            telemetry.writer_receive_wait_ns.fetch_add(
+                elapsed_ns(receive_started.expect("telemetry start must exist")),
+                Ordering::Relaxed,
+            );
+            BufferedTelemetry::observe_queue(&telemetry.completed_queue, receiver.len());
+        }
+        let Some(chunk) = received else {
+            break;
+        };
         let key = chunk.key;
         let chunk_id = chunk.chunk_id;
         stage_boundary(
@@ -3081,9 +4871,35 @@ fn writer_loop(
                 {
                     return Err("Duplicate or stale output chunk ID".into());
                 }
+                pending_chunks = pending_chunks
+                    .checked_add(1)
+                    .ok_or("Pending output chunk count overflow")?;
+                if let Some(telemetry) = telemetry {
+                    telemetry
+                        .writer_pending_max
+                        .fetch_max(pending_chunks, Ordering::Relaxed);
+                }
                 while let Some(chunk) = state.pending.remove(&state.next_chunk_id) {
                     control.check()?;
+                    pending_chunks = pending_chunks
+                        .checked_sub(1)
+                        .ok_or("Pending output chunk count underflow")?;
+                    if let Some(telemetry) = telemetry
+                        && let Some(completed_at) = chunk.completed_at
+                    {
+                        telemetry
+                            .completed_to_append_ns
+                            .fetch_add(elapsed_ns(completed_at), Ordering::Relaxed);
+                    }
+                    let append_started = telemetry.map(|_| Instant::now());
                     append_compressed_chunk(&mut writer, &chunk)?;
+                    if let Some(telemetry) = telemetry {
+                        telemetry.writer_append_ns.fetch_add(
+                            elapsed_ns(append_started.expect("telemetry start must exist")),
+                            Ordering::Relaxed,
+                        );
+                        telemetry.writer_chunks.fetch_add(1, Ordering::Relaxed);
+                    }
                     result.chunks = result.chunks.checked_add(1).ok_or("Chunk count overflow")?;
                     result.compressed_bytes = result
                         .compressed_bytes
@@ -3113,7 +4929,14 @@ fn writer_loop(
             state.next_chunk_id
         ));
     }
+    let finish_started = telemetry.map(|_| Instant::now());
     writer.finish()?;
+    if let Some(telemetry) = telemetry {
+        telemetry.writer_finish_ns.fetch_add(
+            elapsed_ns(finish_started.expect("telemetry start must exist")),
+            Ordering::Relaxed,
+        );
+    }
     Ok(result)
 }
 
@@ -3311,6 +5134,175 @@ fn produce_single(
         )))?;
     }
 
+    Ok(())
+}
+
+fn send_fastq_block(
+    sender: &Sender<Arc<FastqReadBlock>>,
+    builder: FastqReadBlockBuilder,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    let block = builder.finish()?;
+    send_or_cancel(
+        sender,
+        block,
+        control,
+        "Batch-owned FASTQ reader queue disconnected",
+    )
+}
+
+fn stream_fastq_blocks(
+    path: &Path,
+    sender: &Sender<Arc<FastqReadBlock>>,
+    parallel_input: ParallelInput,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    let mut reader = parallel_input.open(path)?;
+    let mut builder = FastqReadBlockBuilder::new()?;
+    loop {
+        control.check()?;
+        let Some(record) = reader.next_record() else {
+            break;
+        };
+        let record = record
+            .map_err(|error| format!("FASTQ parse error in '{}': {error}", path.display()))?;
+        let seq_cow = record.seq();
+        let seq = seq_cow.as_ref();
+        let qual = record
+            .qual()
+            .ok_or_else(|| format!("Input '{}' has no FASTQ quality scores", path.display()))?;
+        builder.push(record.id(), seq, qual)?;
+        if builder.is_full() {
+            send_fastq_block(sender, builder, control)?;
+            builder = FastqReadBlockBuilder::new()?;
+        }
+    }
+    if !builder.is_empty() {
+        send_fastq_block(sender, builder, control)?;
+    }
+    Ok(())
+}
+
+struct FastqBlockStream<'a> {
+    receiver: &'a Receiver<Arc<FastqReadBlock>>,
+    current: Option<Arc<FastqReadBlock>>,
+    next_record: usize,
+    eof: bool,
+}
+
+impl<'a> FastqBlockStream<'a> {
+    fn new(receiver: &'a Receiver<Arc<FastqReadBlock>>) -> Self {
+        Self {
+            receiver,
+            current: None,
+            next_record: 0,
+            eof: false,
+        }
+    }
+
+    fn ensure_record(&mut self, control: &PipelineControl) -> Result<bool, String> {
+        while !self.eof
+            && self
+                .current
+                .as_ref()
+                .is_none_or(|block| self.next_record >= block.records.len())
+        {
+            self.current = recv_or_cancel(self.receiver, control)?;
+            self.next_record = 0;
+            if self.current.is_none() {
+                self.eof = true;
+            }
+        }
+        Ok(!self.eof)
+    }
+
+    fn peek(&self) -> Result<(&Arc<FastqReadBlock>, u32, FastqReadView<'_>), String> {
+        let block = self
+            .current
+            .as_ref()
+            .ok_or("FASTQ block stream has no current record")?;
+        let index =
+            u32::try_from(self.next_record).map_err(|_| "FASTQ record index exceeds u32")?;
+        Ok((block, index, block.record(index)?))
+    }
+
+    fn advance(&mut self) -> Result<(), String> {
+        self.next_record = self
+            .next_record
+            .checked_add(1)
+            .ok_or("FASTQ block record index overflow")?;
+        Ok(())
+    }
+
+    fn take_pending(
+        &mut self,
+        stats: Option<&mut MateQcStats>,
+        control: &PipelineControl,
+    ) -> Result<Option<PendingBatchRecord>, String> {
+        if !self.ensure_record(control)? {
+            return Ok(None);
+        }
+        let (block, record, view) = self.peek()?;
+        if let Some(stats) = stats {
+            stats.update(view.seq, view.qual)?;
+        }
+        let pending = PendingBatchRecord {
+            block: Arc::clone(block),
+            record,
+        };
+        self.advance()?;
+        Ok(Some(pending))
+    }
+}
+
+fn produce_batch_owned_single(
+    path: &Path,
+    batcher: &mut BatchSender,
+    mut stats: Option<&mut MateQcStats>,
+    parallel_input: &ParallelInput,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    let mut reader = parallel_input.open(path)?;
+    let mut builder = FastqReadBlockBuilder::new()?;
+    loop {
+        control.check()?;
+        let Some(record) = reader.next_record() else {
+            break;
+        };
+        let record =
+            record.map_err(|e| format!("FASTQ parse error in '{}': {e}", path.display()))?;
+        let seq_cow = record.seq();
+        let seq = seq_cow.as_ref();
+        let qual = record.qual().ok_or_else(|| {
+            format!(
+                "Input '{}' is not FASTQ or has no quality scores",
+                path.display()
+            )
+        })?;
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.update(seq, qual)?;
+        }
+        builder.push(record.id(), seq, qual)?;
+        if builder.is_full() {
+            let block = builder.finish()?;
+            for record in 0..block.records.len() {
+                batcher.push_batch_single(
+                    &block,
+                    u32::try_from(record).map_err(|_| "FASTQ record index exceeds u32")?,
+                )?;
+            }
+            builder = FastqReadBlockBuilder::new()?;
+        }
+    }
+    if !builder.is_empty() {
+        let block = builder.finish()?;
+        for record in 0..block.records.len() {
+            batcher.push_batch_single(
+                &block,
+                u32::try_from(record).map_err(|_| "FASTQ record index exceeds u32")?,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -3672,6 +5664,327 @@ fn produce_paired(
     })
 }
 
+fn find_batch_resync_offsets(
+    r1_queue: &VecDeque<PendingBatchRecord>,
+    r2_queue: &VecDeque<PendingBatchRecord>,
+) -> Result<Option<(usize, usize)>, String> {
+    if r1_queue.is_empty() || r2_queue.is_empty() {
+        return Ok(None);
+    }
+    let mut r2_positions: HashMap<&[u8], usize> = HashMap::with_capacity(r2_queue.len());
+    for (index, record) in r2_queue.iter().enumerate() {
+        r2_positions
+            .entry(core_read_id(record.view()?.id))
+            .or_insert(index);
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for (r1_index, record) in r1_queue.iter().enumerate() {
+        let Some(&r2_index) = r2_positions.get(core_read_id(record.view()?.id)) else {
+            continue;
+        };
+        let candidate = (r1_index, r2_index);
+        if best.is_none_or(|current| r1_index + r2_index < current.0 + current.1) {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
+fn push_pending_orphan(
+    batcher: &mut BatchSender,
+    mate: OutputMate,
+    record: PendingBatchRecord,
+) -> Result<(), String> {
+    batcher.push_batch_orphan(mate, &record.block, record.record)
+}
+
+fn drain_pending_orphans(
+    queue: &mut VecDeque<PendingBatchRecord>,
+    count: usize,
+    mate: OutputMate,
+    batcher: &mut BatchSender,
+) -> Result<(), String> {
+    for _ in 0..count {
+        let record = queue
+            .pop_front()
+            .ok_or("Internal error: missing buffered batch-owned orphan record")?;
+        push_pending_orphan(batcher, mate, record)?;
+    }
+    Ok(())
+}
+
+fn drain_batch_stream_as_orphans(
+    stream: &mut FastqBlockStream<'_>,
+    mate: OutputMate,
+    mut stats: Option<&mut MateQcStats>,
+    batcher: &mut BatchSender,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    while stream.ensure_record(control)? {
+        let (block, record, view) = stream.peek()?;
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.update(view.seq, view.qual)?;
+        }
+        batcher.push_batch_orphan(mate, block, record)?;
+        stream.advance()?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_batch_pairing(
+    first_r1: PendingBatchRecord,
+    first_r2: PendingBatchRecord,
+    r1_stream: &mut FastqBlockStream<'_>,
+    r2_stream: &mut FastqBlockStream<'_>,
+    batcher: &mut BatchSender,
+    mut r1_stats: Option<&mut MateQcStats>,
+    mut r2_stats: Option<&mut MateQcStats>,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    // Arc clones are deliberately limited to this exceptional, bounded
+    // resynchronization window.  The normal paired path registers each parser
+    // block once per work batch and performs no per-record reference counting.
+    let mut r1_queue = VecDeque::from([first_r1]);
+    let mut r2_queue = VecDeque::from([first_r2]);
+    let mut r1_eof = false;
+    let mut r2_eof = false;
+
+    loop {
+        if let Some((r1_orphans, r2_orphans)) = find_batch_resync_offsets(&r1_queue, &r2_queue)? {
+            drain_pending_orphans(&mut r1_queue, r1_orphans, OutputMate::R1, batcher)?;
+            drain_pending_orphans(&mut r2_queue, r2_orphans, OutputMate::R2, batcher)?;
+            let r1 = r1_queue
+                .pop_front()
+                .ok_or("Internal error: missing resynchronized batch-owned R1 record")?;
+            let r2 = r2_queue
+                .pop_front()
+                .ok_or("Internal error: missing resynchronized batch-owned R2 record")?;
+            batcher.push_batch_pair(&r1.block, r1.record, &r2.block, r2.record)?;
+            if r1_queue.is_empty() && r2_queue.is_empty() {
+                return Ok(());
+            }
+            continue;
+        }
+
+        if r1_eof && r2_eof {
+            let r1_orphans = r1_queue.len();
+            let r2_orphans = r2_queue.len();
+            drain_pending_orphans(&mut r1_queue, r1_orphans, OutputMate::R1, batcher)?;
+            drain_pending_orphans(&mut r2_queue, r2_orphans, OutputMate::R2, batcher)?;
+            return Ok(());
+        }
+        if r1_eof && r1_queue.is_empty() {
+            let r2_orphans = r2_queue.len();
+            drain_pending_orphans(&mut r2_queue, r2_orphans, OutputMate::R2, batcher)?;
+            drain_batch_stream_as_orphans(
+                r2_stream,
+                OutputMate::R2,
+                r2_stats.as_deref_mut(),
+                batcher,
+                control,
+            )?;
+            return Ok(());
+        }
+        if r2_eof && r2_queue.is_empty() {
+            let r1_orphans = r1_queue.len();
+            drain_pending_orphans(&mut r1_queue, r1_orphans, OutputMate::R1, batcher)?;
+            drain_batch_stream_as_orphans(
+                r1_stream,
+                OutputMate::R1,
+                r1_stats.as_deref_mut(),
+                batcher,
+                control,
+            )?;
+            return Ok(());
+        }
+
+        let mut progressed = false;
+        if !r1_eof && r1_queue.len() < PAIRED_RESYNC_WINDOW {
+            match r1_stream.take_pending(r1_stats.as_deref_mut(), control)? {
+                Some(record) => {
+                    r1_queue.push_back(record);
+                    progressed = true;
+                }
+                None => r1_eof = true,
+            }
+            if find_batch_resync_offsets(&r1_queue, &r2_queue)?.is_some() {
+                continue;
+            }
+        }
+        if !r2_eof && r2_queue.len() < PAIRED_RESYNC_WINDOW {
+            match r2_stream.take_pending(r2_stats.as_deref_mut(), control)? {
+                Some(record) => {
+                    r2_queue.push_back(record);
+                    progressed = true;
+                }
+                None => r2_eof = true,
+            }
+            if find_batch_resync_offsets(&r1_queue, &r2_queue)?.is_some() {
+                continue;
+            }
+        }
+        if !progressed && !(r1_eof && r2_eof) {
+            let r1_id = match r1_queue.front() {
+                Some(record) => record.view()?.id,
+                None => b"<empty>",
+            };
+            let r2_id = match r2_queue.front() {
+                Some(record) => record.view()?.id,
+                None => b"<empty>",
+            };
+            return Err(format!(
+                "Could not resynchronize paired FASTQ records within {PAIRED_RESYNC_WINDOW} records: '{}' vs '{}'",
+                String::from_utf8_lossy(r1_id),
+                String::from_utf8_lossy(r2_id),
+            ));
+        }
+    }
+}
+
+fn produce_batch_owned_paired_from_streams(
+    r1_stream: &mut FastqBlockStream<'_>,
+    r2_stream: &mut FastqBlockStream<'_>,
+    batcher: &mut BatchSender,
+    mut r1_stats: Option<&mut MateQcStats>,
+    mut r2_stats: Option<&mut MateQcStats>,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    loop {
+        let have_r1 = r1_stream.ensure_record(control)?;
+        let have_r2 = r2_stream.ensure_record(control)?;
+        match (have_r1, have_r2) {
+            (false, false) => return Ok(()),
+            (true, false) => {
+                return drain_batch_stream_as_orphans(
+                    r1_stream,
+                    OutputMate::R1,
+                    r1_stats.as_deref_mut(),
+                    batcher,
+                    control,
+                );
+            }
+            (false, true) => {
+                return drain_batch_stream_as_orphans(
+                    r2_stream,
+                    OutputMate::R2,
+                    r2_stats.as_deref_mut(),
+                    batcher,
+                    control,
+                );
+            }
+            (true, true) => {}
+        }
+
+        let (r1_block, r1_record, r1_view) = r1_stream.peek()?;
+        let (r2_block, r2_record, r2_view) = r2_stream.peek()?;
+        if let Some(stats) = r1_stats.as_deref_mut() {
+            stats.update(r1_view.seq, r1_view.qual)?;
+        }
+        if let Some(stats) = r2_stats.as_deref_mut() {
+            stats.update(r2_view.seq, r2_view.qual)?;
+        }
+
+        if core_read_id(r1_view.id) == core_read_id(r2_view.id) {
+            batcher.push_batch_pair(r1_block, r1_record, r2_block, r2_record)?;
+            r1_stream.advance()?;
+            r2_stream.advance()?;
+            continue;
+        }
+
+        let first_r1 = PendingBatchRecord {
+            block: Arc::clone(r1_block),
+            record: r1_record,
+        };
+        let first_r2 = PendingBatchRecord {
+            block: Arc::clone(r2_block),
+            record: r2_record,
+        };
+        r1_stream.advance()?;
+        r2_stream.advance()?;
+        recover_batch_pairing(
+            first_r1,
+            first_r2,
+            r1_stream,
+            r2_stream,
+            batcher,
+            r1_stats.as_deref_mut(),
+            r2_stats.as_deref_mut(),
+            control,
+        )?;
+    }
+}
+
+fn produce_batch_owned_paired(
+    r1_path: &Path,
+    r2_path: &Path,
+    batcher: &mut BatchSender,
+    r1_stats: Option<&mut MateQcStats>,
+    r2_stats: Option<&mut MateQcStats>,
+    parallel_input: &ParallelInput,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    thread::scope(|scope| {
+        stage_boundary(
+            control,
+            "Batch-owned paired input scope coordinator",
+            || {
+                let (r1_tx, r1_rx) = bounded::<Arc<FastqReadBlock>>(FASTQ_BLOCK_QUEUE);
+                let (r2_tx, r2_rx) = bounded::<Arc<FastqReadBlock>>(FASTQ_BLOCK_QUEUE);
+                let r1_input = parallel_input.clone();
+                let r2_input = parallel_input.clone();
+                let r1_control = control.clone();
+                let r2_control = control.clone();
+                let r1_handle = scope.spawn(move || {
+                    stage_boundary(&r1_control, "Batch-owned R1 input reader", || {
+                        stream_fastq_blocks(r1_path, &r1_tx, r1_input, &r1_control)
+                    })
+                });
+                let r2_handle = scope.spawn(move || {
+                    stage_boundary(&r2_control, "Batch-owned R2 input reader", || {
+                        stream_fastq_blocks(r2_path, &r2_tx, r2_input, &r2_control)
+                    })
+                });
+                let mut r1_stream = FastqBlockStream::new(&r1_rx);
+                let mut r2_stream = FastqBlockStream::new(&r2_rx);
+                let producer =
+                    stage_boundary(control, "Batch-owned paired input coordinator", || {
+                        produce_batch_owned_paired_from_streams(
+                            &mut r1_stream,
+                            &mut r2_stream,
+                            batcher,
+                            r1_stats,
+                            r2_stats,
+                            control,
+                        )
+                    });
+                drop(r1_rx);
+                drop(r2_rx);
+                let r1_result = match r1_handle.join() {
+                    Ok(result) => result,
+                    Err(payload) => Err(control.fail(format!(
+                        "Batch-owned R1 reader boundary panicked: {}",
+                        panic_payload(payload)
+                    ))),
+                };
+                let r2_result = match r2_handle.join() {
+                    Ok(result) => result,
+                    Err(payload) => Err(control.fail(format!(
+                        "Batch-owned R2 reader boundary panicked: {}",
+                        panic_payload(payload)
+                    ))),
+                };
+                if let Some(error) = control.first_error() {
+                    return Err(error);
+                }
+                producer?;
+                r1_result?;
+                r2_result
+            },
+        )
+    })
+}
+
 #[cfg(test)]
 mod test_failure {
     use std::collections::HashSet;
@@ -3788,6 +6101,35 @@ mod tests {
     use crate::writer::INCOMPLETE_RUN_MARKER;
     use flate2::read::MultiGzDecoder;
 
+    #[test]
+    fn buffered_worker_counts_match_fixed_paired_fastq_plan() {
+        let eight = ThreadPlan::new(8, true, true).unwrap();
+        let twenty_four = ThreadPlan::new(24, true, true).unwrap();
+        assert_eq!(
+            (
+                eight.initial_input_threads,
+                dedicated_accumulator_worker_slots(eight.initial_worker_threads).unwrap()
+            ),
+            (2, (1, 2))
+        );
+        assert_eq!(
+            (
+                twenty_four.initial_input_threads,
+                dedicated_accumulator_worker_slots(twenty_four.initial_worker_threads).unwrap()
+            ),
+            (7, (4, 10))
+        );
+    }
+
+    #[test]
+    fn dedicated_accumulator_consumes_one_existing_worker_slot() {
+        assert_eq!(dedicated_accumulator_worker_slots(4), Ok((1, 2)));
+        assert_eq!(dedicated_accumulator_worker_slots(15), Ok((4, 10)));
+        assert!(dedicated_accumulator_worker_slots(1).is_err());
+        assert!(dedicated_accumulator_worker_slots(2).is_err());
+        assert_eq!(dedicated_accumulator_worker_slots(3), Ok((1, 1)));
+    }
+
     fn test_output_dir(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3805,6 +6147,7 @@ mod tests {
                 },
                 chunk_id,
                 fastq_bytes: text.as_bytes().to_vec(),
+                flush_reason: CompressionFlushReason::ChunkThreshold,
             },
             2,
             PermitGuard::detached("test compression"),
@@ -3848,7 +6191,7 @@ mod tests {
         let result = thread::scope(|scope| {
             let writer_control = control.clone();
             let handle =
-                scope.spawn(move || writer_loop(writer, &receiver, layout, &writer_control));
+                scope.spawn(move || writer_loop(writer, &receiver, layout, &writer_control, None));
             sender.send(chunk(0, 1, "@a1\nTGCA\n+\nIIII\n")).unwrap();
             sender.send(chunk(1, 0, "@b0\nCCCC\n+\nIIII\n")).unwrap();
             // Opening sample 2 evicts and flushes sample 1 while sample 0 is
@@ -3935,6 +6278,7 @@ mod tests {
             &buffered_receiver,
             OutputLayout::new(1, false, false),
             &PipelineControl::new(),
+            None,
         )
         .unwrap_err();
         assert!(buffered_error.contains("before chunk 0"));
@@ -3956,6 +6300,50 @@ mod tests {
             std::mem::size_of::<OwnedFastqRecord>(),
             3 * std::mem::size_of::<Vec<u8>>()
         );
+    }
+
+    #[test]
+    fn batch_owned_fastq_descriptors_are_compact_and_pointer_free() {
+        assert_eq!(std::mem::size_of::<ByteSpan>(), 8);
+        assert_eq!(std::mem::size_of::<FastqRecordDescriptor>(), 24);
+        assert_eq!(std::mem::size_of::<BatchFastqRecordRef>(), 8);
+        assert!(
+            std::mem::size_of::<FastqRecordDescriptor>() < std::mem::size_of::<OwnedFastqRecord>()
+        );
+    }
+
+    #[test]
+    fn batch_owned_fastq_spans_reject_overflow_and_out_of_bounds_access() {
+        let maximum = u32::MAX as usize;
+        assert_eq!(
+            ByteSpan::checked(maximum - 1, 1),
+            Ok(ByteSpan {
+                start: u32::MAX - 1,
+                len: 1,
+            })
+        );
+        assert!(ByteSpan::checked(maximum, 1).is_err());
+        assert!(ByteSpan::checked(usize::MAX, 1).is_err());
+        let span = ByteSpan::checked(2, 2).unwrap();
+        assert_eq!(span.resolve(b"ABCDE"), Ok(b"CD".as_slice()));
+        assert!(ByteSpan::checked(4, 2).unwrap().resolve(b"ABCDE").is_err());
+    }
+
+    #[test]
+    fn batch_owned_fastq_block_keeps_fields_in_one_immutable_backing() {
+        let mut builder = FastqReadBlockBuilder::new().unwrap();
+        builder.push(b"read/1", b"ACGT", b"!I~?").unwrap();
+        builder.push(b"read/2", b"TGCA", b"IIII").unwrap();
+        let block = builder.finish().unwrap();
+        let first = block.record(0).unwrap();
+        assert_eq!(first.id, b"read/1");
+        assert_eq!(first.seq, b"ACGT");
+        assert_eq!(first.qual, b"!I~?");
+        let second = block.record(1).unwrap();
+        assert_eq!(second.id, b"read/2");
+        assert_eq!(second.seq, b"TGCA");
+        assert_eq!(second.qual, b"IIII");
+        assert!(block.record(2).is_err());
     }
 
     #[test]
@@ -4135,6 +6523,10 @@ mod tests {
         let failure_kind =
             std::env::var("PLEXLESS_TEST_FAILURE_KIND").unwrap_or_else(|_| "panic".into());
         let paired = std::env::var("PLEXLESS_TEST_PAIRED").as_deref() == Ok("1");
+        let threads = std::env::var("PLEXLESS_TEST_THREADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
         let mode = if stage.starts_with("direct-") {
             OutputMode::Direct
         } else {
@@ -4206,7 +6598,7 @@ mod tests {
             low_sample_fraction: 0.05,
         };
 
-        let error = run(args, 8, InputSource::Fastq(inputs)).unwrap_err();
+        let error = run(args, threads, InputSource::Fastq(inputs)).unwrap_err();
         let expected_root = if failure_kind == "error" {
             assert!(error.contains("failed"), "unexpected error: {error}");
             format!("injected {stage} fatal error")
@@ -4221,6 +6613,9 @@ mod tests {
         match stage {
             "direct-worker" | "routing-worker" | "direct-writer" | "aggregation" => {
                 assert!(error.contains("batch 0"), "batch context missing: {error}");
+            }
+            "accumulator" => {
+                assert!(error.contains("unit 0"), "batch context missing: {error}");
             }
             "compression-worker" | "buffered-writer" => {
                 assert!(
@@ -4251,28 +6646,32 @@ mod tests {
         let cases = [
             // Batch zero stays owned while every other batch credit reaches an
             // ordered pending map, so the producer is blocked on credit 29.
-            ("direct-worker:0:27", false, "panic", 3),
-            ("direct-writer:0:0", false, "panic", 1),
-            ("routing-worker:0:27", false, "panic", 3),
-            ("routing-worker:0:23", true, "panic", 3),
+            ("direct-worker:0:27", false, "panic", 3, 8),
+            ("direct-writer:0:0", false, "panic", 1, 8),
+            ("routing-worker:0:27", false, "panic", 3, 8),
+            // The selected eight-thread paired plan has one routing worker;
+            // use a larger fixed plan to exercise concurrent routing failure.
+            ("routing-worker:0:27", true, "panic", 3, 12),
             // Chunk zero stays active while all 27 remaining end-to-end
             // compression credits are held by later ordered chunks.
-            ("compression-worker:0:27", false, "panic", 3),
-            ("aggregation:0:0", false, "panic", 1),
-            ("buffered-writer:0:0", false, "panic", 1),
+            ("compression-worker:0:27", false, "panic", 3, 8),
+            ("aggregation:0:0", false, "panic", 1, 8),
+            ("accumulator:0:0", false, "panic", 1, 8),
+            ("buffered-writer:0:0", false, "panic", 1, 8),
             // Ordinary fatal stage errors use the same first-error shutdown
             // path without going through panic capture.
-            ("compression-worker:0:27", false, "error", 1),
+            ("compression-worker:0:27", false, "error", 1, 8),
         ];
 
-        for (failure, paired, failure_kind, repetitions) in cases {
+        for (failure, paired, failure_kind, repetitions, threads) in cases {
             for repetition in 0..repetitions {
                 let log_path = test_output_dir(&format!(
                     "failure-parent-{}-{failure_kind}-{repetition}",
                     failure.replace(':', "-")
                 ));
                 let log = fs::File::create(&log_path).unwrap();
-                let mut child = Command::new(std::env::current_exe().unwrap())
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
                     .args([
                         "--exact",
                         "parallel::tests::injected_pipeline_failure_child",
@@ -4282,6 +6681,8 @@ mod tests {
                     .env("PLEXLESS_TEST_FAILURE", failure)
                     .env("PLEXLESS_TEST_FAILURE_KIND", failure_kind)
                     .env("PLEXLESS_TEST_PAIRED", if paired { "1" } else { "0" })
+                    .env("PLEXLESS_TEST_THREADS", threads.to_string());
+                let mut child = command
                     .stdout(Stdio::null())
                     .stderr(Stdio::from(log))
                     .spawn()

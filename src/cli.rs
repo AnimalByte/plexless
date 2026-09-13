@@ -85,13 +85,13 @@ fn parse_byte_size(value: &str) -> Result<ByteSizeSetting, String> {
 }
 
 #[derive(Parser, Debug)]
+#[command(version)]
 #[command(name = "plexless")]
 #[command(about = "FASTQ and unmapped CRAM nested demultiplexing tool")]
 pub struct Cli {
-    /// Total CPU-work budget. plexless accounts for FASTQ parsing and
-    /// dynamically shares remaining capacity between gzip decompression and
-    /// demultiplexing/output compression. A value of 1 preserves the serial
-    /// reference pipeline.
+    /// Total CPU-work budget. Plexless accounts for parsing, decompression,
+    /// routing, accumulation, and compression. A value of 1 preserves the
+    /// serial reference pipeline.
     #[arg(
         long,
         global = true,
@@ -193,7 +193,7 @@ pub struct DemuxArgs {
     #[arg(long, value_enum, default_value_t = OutputMode::Auto)]
     pub output_mode: OutputMode,
 
-    /// Uncompressed bytes per gzip member (auto, or e.g. 256K, 1M)
+    /// Uncompressed bytes per gzip member (auto uses 32 KiB for FASTQ input)
     #[arg(long, default_value = "auto", value_parser = parse_byte_size)]
     pub output_chunk_size: ByteSizeSetting,
 
@@ -279,6 +279,7 @@ mod tests {
             parse_byte_size("2G"),
             Ok(ByteSizeSetting::Bytes(2 * 1024 * 1024 * 1024))
         );
+        assert!(parse_byte_size("18446744073709551615G").is_err());
         assert!(parse_byte_size("12XB").is_err());
         assert!(parse_byte_size("0").is_err());
     }

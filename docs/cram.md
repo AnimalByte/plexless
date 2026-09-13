@@ -118,9 +118,9 @@ the MIT/Expat license.
 
 `hts-sys` transitively requests static zlib. Plexless's checked-in Cargo
 configuration sets `LIBZ_SYS_STATIC=0`, the supported `libz-sys` override, so
-the existing flate2 path and HTSlib share the established system `libz` rather
-than silently replacing FASTQ compression. This is both a compatibility and a
-measured FASTQ-regression safeguard.
+HTSlib links the dynamic system `libz`. FASTQ output independently uses
+flate2's zlib-rs backend. This preserves the qualified HTSlib linkage without
+forcing FASTQ compression back to the system-zlib backend.
 
 For CRAM input, `--threads` is the global staged-pipeline budget. Plexless calls
 rust-htslib `Reader::set_threads(N)`; HTSlib defines `N` as extra background

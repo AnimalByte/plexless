@@ -21,17 +21,18 @@ reads have each mate's declared structured prefix trimmed; unassigned and
 orphan reads remain untrimmed.
 
 `InputSource` keeps one-file CRAM separate from FASTQ's `Single`/`Paired`
-paths. Both frontends produce the existing owned `id`/`seq`/`qual` record and
-`WorkItem` concepts. CRAM numeric Phred qualities are normalized to Phred+33 at
-that boundary. Optional CRAM source records exist only in CRAM-specific work
-variants and are ignored by routing. The ordinary FASTQ record remains three
-`Vec<u8>` values, so the metadata carrier adds no per-record FASTQ allocation
-or struct-size cost.
+paths. Parallel buffered FASTQ input is copied once into immutable byte blocks;
+work items carry compact block/record descriptors rather than owned `id`/`seq`/
+`qual` vectors. Serial FASTQ and the low-fan-out direct path retain their simpler
+owned-record/writer machinery. CRAM keeps an owned normalized FASTQ-style read
+alongside the original HTS record because metadata must remain attached through
+routing and optional CRAM output. Numeric CRAM qualities are converted to
+Phred+33 at that boundary.
 
-CRAM output diverges only after the shared route/trim decision. Its ordered
-writer updates SEQ/QUAL in the carried source record and applies the documented
-metadata policy. FASTQ output retains its established byte serialization,
-compression, buffering, and writer paths unchanged.
+CRAM output diverges after the shared route/trim decision. Its ordered writer
+updates SEQ/QUAL in the carried source record and applies the documented metadata
+policy. Buffered FASTQ instead serializes borrowed batch-owned records directly
+into persistent destination accumulators before parallel gzip compression.
 
 ## Compiled hierarchical model
 
@@ -99,43 +100,51 @@ member and reopening appends a new standards-compliant member.
 The buffered pipeline separates scheduling batches from compression:
 
 ```text
-bounded 1,024-record work batches
-  -> parallel route/serialize into per-output batch fragments
-  -> input-ordered persistent sample/mate accumulation
+Needletail records copied once into immutable batch-owned byte blocks
+  -> compact checked descriptors routed in bounded 1,024-record work batches
+  -> global input-batch order restoration
+  -> one destination accumulator with direct FASTQ serialization
   -> bounded compression jobs with per-output chunk IDs
-  -> parallel independent gzip members
+  -> shared parallel zlib-rs gzip compression
   -> per-output ordered append through an adaptive LRU writer cache
 ```
 
-The accumulator briefly orders completed input batches so fragments enter each
-sample in source order. Compression completion is not globally ordered. The
-writer keeps a separate next-chunk ID for every `(sample_id, mate)` output, so
-one ready sample can progress while another sample's earlier chunk is still
-compressing. Paired R1 and R2 fragments are accumulated from the same ordered
-batch stream and therefore retain correspondence.
+Read descriptors contain `u32` offsets and lengths into their owning immutable
+block; checked construction and lookup prevent truncation or out-of-bounds
+access. Routing borrows sequence slices and assigned-read trimming advances an
+offset rather than copying biological bytes. The ordered coordinator forwards
+each canonical batch to exactly one accumulator, which serializes each record
+once into its final uncompressed destination buffer. Compression completion is
+not globally ordered. The writer keeps a separate next-chunk ID for every
+`(sample_id, mate)` output, so one ready sample can progress while another
+sample's earlier chunk is still compressing. Paired R1 and R2 contributions
+come from the same ordered batch stream and therefore retain correspondence.
 
 Each gzip member is independently valid. Appending members creates an ordinary
 concatenated `.fastq.gz` readable by standard multi-member gzip tools.
 
 ## Bounded-memory model
 
-Buffered auto sizing reads Linux `MemAvailable` and, when present, tighter cgroup memory
-headroom. One quarter is assigned to active output bytes, clamped to 16 MiB–2
-GiB and never above half of available memory. Dividing that budget by expected
-sample/mate/unassigned streams produces a 128 KiB–1 MiB target chunk. A global
-pressure check flushes the largest accumulator when the logical budget is
-exceeded; vector growth can transiently reserve more capacity, which is why the
-policy leaves substantial headroom.
+Buffered auto sizing reads Linux `MemAvailable` and, when present, tighter
+cgroup memory headroom. One quarter is assigned to active output bytes, clamped
+to 16 MiB–2 GiB and never above half of available memory. FASTQ input uses a
+qualified 32 KiB target chunk; CRAM-to-FASTQ retains the established
+memory-per-stream 128 KiB–1 MiB target. A global pressure check flushes the
+largest accumulator when the logical budget is exceeded; vector growth can
+transiently reserve more capacity, which is why the policy leaves substantial
+headroom.
 
 Work, processed-batch, compression-job, and compressed-result channels are all
 bounded. One end-to-end credit pool bounds active and completed batches plus
 the pre-aggregation reorder map. A second bounds queued jobs, active
 compression, completed members, and writer reorder state. Its credit count is
-the smaller of twice the worker-queue depth and the accumulator budget divided
-by the target chunk size. A chunk can exceed its target by at most one
-serialized work-batch fragment, and an active encoder briefly holds compressed
-and uncompressed forms; these bounded transients are included in the process
-headroom rather than the accumulator's logical-byte counter. Paired
+the smaller of a bounded queue-derived limit and the accumulator budget divided
+by the target chunk size. Buffered FASTQ reserves eight ready-job slots and
+eight compression credits per base queue unit; CRAM-to-FASTQ retains its
+previous queue relationship. A chunk can exceed its target by one serialized
+record, and an active encoder briefly holds compressed and uncompressed forms;
+these bounded transients are included in the process headroom rather than the
+accumulator's logical-byte counter. Paired
 resynchronization is separately bounded to 1,024 records per mate, plus
 256-record reader queues.
 
@@ -161,13 +170,14 @@ output. Serial direct caches at most its configured number of gzip encoders;
 parallel direct caches that many raw writers while each active worker owns one
 transient encoder.
 
-Buffered parallel runs reserve at least one routing worker and one compression worker.
-When the requested thread budget leaves only one shared CPU slot, this creates
-a one-thread minimum pipeline overcommit; the startup allocation line reports
-it explicitly. Larger budgets split the existing shared worker allocation and
-remain within it. `--threads 1` continues to use the serial reference path.
-Direct parallel runs use the shared worker pool for combined routing and
-compression rather than splitting it into two stages.
+Buffered FASTQ fixes its stage allocation at startup. When the shared worker
+budget can retain at least one routing and one compression worker, one existing
+worker slot is reserved for the dedicated accumulator. Smaller parallel budgets
+combine ordering and accumulation instead. The order coordinator and ordered
+writer are fixed infrastructure threads outside the work budget, as in the
+existing staged design; startup reports the exact allocation and any minimum
+overcommit. `--threads 1` continues to use the serial reference path. Direct
+parallel runs retain their shared combined routing/compression worker design.
 
 CRAM thread planning is isolated from FASTQ planning. rust-htslib
 `Reader::set_threads(N)` supplies `N` additional HTSlib decoder workers. For

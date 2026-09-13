@@ -2,6 +2,7 @@ use std::fs;
 
 use clap::ValueEnum;
 
+pub(crate) const FASTQ_BUFFERED_CHUNK_TARGET: usize = 32 * 1024;
 pub(crate) const AUTO_MIN_CHUNK_SIZE: usize = 128 * 1024;
 pub(crate) const AUTO_MAX_CHUNK_SIZE: usize = 1024 * 1024;
 const AUTO_MIN_BUFFER_BUDGET: usize = 16 * 1024 * 1024;
@@ -238,7 +239,6 @@ pub(crate) fn calculate_output_buffer_policy(
     if available_memory == 0 {
         return Err("Available memory must be greater than 0".into());
     }
-
     let automatic_budget = (available_memory / 4)
         .clamp(
             AUTO_MIN_BUFFER_BUDGET.min(available_memory),
@@ -277,11 +277,36 @@ pub(crate) fn calculate_output_buffer_policy(
     })
 }
 
+/// FASTQ input uses the qualified fixed buffered chunk target unless the user
+/// explicitly overrides it. Keeping this policy in one helper ensures serial
+/// and parallel buffered FASTQ paths cannot drift apart.
+pub(crate) fn calculate_fastq_output_buffer_policy(
+    expected_streams: usize,
+    available_memory: usize,
+    chunk_override: Option<usize>,
+    memory_override: Option<usize>,
+) -> Result<OutputBufferPolicy, String> {
+    calculate_output_buffer_policy(
+        expected_streams,
+        available_memory,
+        Some(chunk_override.unwrap_or(FASTQ_BUFFERED_CHUNK_TARGET)),
+        memory_override,
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct CompressionJob {
     pub(crate) key: OutputKey,
     pub(crate) chunk_id: u64,
     pub(crate) fastq_bytes: Vec<u8>,
+    pub(crate) flush_reason: CompressionFlushReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompressionFlushReason {
+    ChunkThreshold,
+    MemoryPressure,
+    FinalDrain,
 }
 
 #[derive(Debug, Default)]
@@ -299,6 +324,7 @@ pub(crate) struct OutputAccumulator {
     chunk_size: usize,
     memory_budget: usize,
     buffered_bytes: usize,
+    active_buffers: usize,
 }
 
 impl OutputAccumulator {
@@ -317,6 +343,7 @@ impl OutputAccumulator {
             chunk_size,
             memory_budget,
             buffered_bytes: 0,
+            active_buffers: 0,
         })
     }
 
@@ -338,6 +365,10 @@ impl OutputAccumulator {
             .get_mut(index)
             .ok_or("Output accumulator index is missing")?;
         if buffer.bytes.is_empty() {
+            self.active_buffers = self
+                .active_buffers
+                .checked_add(1)
+                .ok_or("Active output buffer count overflow")?;
             std::mem::swap(&mut buffer.bytes, &mut bytes);
         } else {
             buffer.bytes.extend_from_slice(&bytes);
@@ -370,6 +401,12 @@ impl OutputAccumulator {
             .buffers
             .get_mut(index)
             .ok_or("Output accumulator index is missing")?;
+        if accumulator.bytes.is_empty() {
+            self.active_buffers = self
+                .active_buffers
+                .checked_add(1)
+                .ok_or("Active output buffer count overflow")?;
+        }
         accumulator.bytes.reserve(record_len);
         accumulator.bytes.extend_from_slice(b"@");
         accumulator.bytes.extend_from_slice(id);
@@ -390,7 +427,7 @@ impl OutputAccumulator {
     fn flush_ready(&mut self, appended_index: usize) -> Result<Vec<CompressionJob>, String> {
         let mut jobs = Vec::new();
         if self.buffers[appended_index].bytes.len() >= self.chunk_size {
-            jobs.push(self.flush_index(appended_index)?);
+            jobs.push(self.flush_index(appended_index, CompressionFlushReason::ChunkThreshold)?);
         }
         while self.buffered_bytes > self.memory_budget {
             let largest = self
@@ -401,23 +438,40 @@ impl OutputAccumulator {
                 .max_by_key(|(_, buffer)| buffer.bytes.len())
                 .map(|(index, _)| index)
                 .ok_or("Output memory budget exceeded without buffered output")?;
-            jobs.push(self.flush_index(largest)?);
+            jobs.push(self.flush_index(largest, CompressionFlushReason::MemoryPressure)?);
         }
         Ok(jobs)
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
+
+    pub(crate) fn active_buffers(&self) -> usize {
+        self.active_buffers
+    }
+
+    pub(crate) fn layout(&self) -> OutputLayout {
+        self.layout
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<CompressionJob>, String> {
         let mut jobs = Vec::new();
         for index in 0..self.buffers.len() {
             if !self.buffers[index].bytes.is_empty() {
-                jobs.push(self.flush_index(index)?);
+                jobs.push(self.flush_index(index, CompressionFlushReason::FinalDrain)?);
             }
         }
         debug_assert_eq!(self.buffered_bytes, 0);
+        debug_assert_eq!(self.active_buffers, 0);
         Ok(jobs)
     }
 
-    fn flush_index(&mut self, index: usize) -> Result<CompressionJob, String> {
+    fn flush_index(
+        &mut self,
+        index: usize,
+        flush_reason: CompressionFlushReason,
+    ) -> Result<CompressionJob, String> {
         let key = self.layout.key_at(index)?;
         let accumulator = self
             .buffers
@@ -428,6 +482,10 @@ impl OutputAccumulator {
             .buffered_bytes
             .checked_sub(fastq_bytes.len())
             .ok_or("Output buffer byte count underflow")?;
+        self.active_buffers = self
+            .active_buffers
+            .checked_sub(1)
+            .ok_or("Active output buffer count underflow")?;
         let chunk_id = accumulator.next_chunk_id;
         accumulator.next_chunk_id = accumulator
             .next_chunk_id
@@ -437,6 +495,7 @@ impl OutputAccumulator {
             key,
             chunk_id,
             fastq_bytes,
+            flush_reason,
         })
     }
 }
@@ -457,6 +516,23 @@ mod tests {
     }
 
     #[test]
+    fn fastq_auto_policy_uses_qualified_chunk_target() {
+        let mib = 1024 * 1024;
+        let policy = calculate_fastq_output_buffer_policy(768, 8 * 1024 * mib, None, None).unwrap();
+        assert_eq!(policy.chunk_size, FASTQ_BUFFERED_CHUNK_TARGET);
+
+        let overridden = calculate_fastq_output_buffer_policy(
+            768,
+            8 * 1024 * mib,
+            Some(64 * 1024),
+            Some(512 * mib),
+        )
+        .unwrap();
+        assert_eq!(overridden.chunk_size, 64 * 1024);
+        assert_eq!(overridden.memory_budget, 512 * mib);
+    }
+
+    #[test]
     fn explicit_policy_honors_valid_values_and_rejects_unsafe_ones() {
         let mib = 1024 * 1024;
         let policy = calculate_output_buffer_policy(
@@ -470,6 +546,17 @@ mod tests {
         assert_eq!(policy.memory_budget, 512 * mib);
         assert!(calculate_output_buffer_policy(1, 64 * mib, None, Some(40 * mib)).is_err());
         assert!(calculate_output_buffer_policy(1, 1024 * mib, Some(16 * 1024), None).is_err());
+    }
+
+    #[test]
+    fn explicit_budget_may_exceed_two_gib_when_memory_allows() {
+        let gib = 1024 * 1024 * 1024;
+        let policy =
+            calculate_output_buffer_policy(768, 32 * gib, Some(4 * 1024 * 1024), Some(8 * gib))
+                .unwrap();
+        assert_eq!(policy.memory_budget, 8 * gib);
+        assert_eq!(policy.chunk_size, 4 * 1024 * 1024);
+        assert!(calculate_output_buffer_policy(768, 16 * gib, None, Some(9 * gib)).is_err());
     }
 
     #[test]
@@ -523,6 +610,7 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].chunk_id, 0);
         assert_eq!(jobs[0].fastq_bytes.len(), 11);
+        assert_eq!(jobs[0].flush_reason, CompressionFlushReason::MemoryPressure);
     }
 
     #[test]
@@ -537,9 +625,17 @@ mod tests {
         let first = accumulator.append(key, vec![b'B'; 5]).unwrap();
         assert_eq!(first[0].chunk_id, 0);
         assert_eq!(first[0].fastq_bytes, b"AAAAAABBBBB");
+        assert_eq!(
+            first[0].flush_reason,
+            CompressionFlushReason::ChunkThreshold
+        );
         assert!(accumulator.append(key, vec![b'C'; 3]).unwrap().is_empty());
         let final_jobs = accumulator.finish().unwrap();
         assert_eq!(final_jobs[0].chunk_id, 1);
         assert_eq!(final_jobs[0].fastq_bytes, b"CCC");
+        assert_eq!(
+            final_jobs[0].flush_reason,
+            CompressionFlushReason::FinalDrain
+        );
     }
 }

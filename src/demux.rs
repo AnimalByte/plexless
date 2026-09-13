@@ -8,7 +8,7 @@ use crate::cli::DemuxArgs;
 use crate::fastq::InputReader;
 use crate::input::{InputFiles, InputSource, resolve_input_source, resolve_inputs};
 use crate::output::{
-    OutputLayout, ResolvedOutputMode, available_memory_bytes, calculate_output_buffer_policy,
+    OutputLayout, ResolvedOutputMode, available_memory_bytes, calculate_fastq_output_buffer_policy,
     report_output_mode, resolve_output_mode,
 };
 use crate::routing::{RouteResult, RoutingTree};
@@ -142,7 +142,7 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
             )?)
         }
         ResolvedOutputMode::Buffered => {
-            let output_policy = calculate_output_buffer_policy(
+            let output_policy = calculate_fastq_output_buffer_policy(
                 expected_streams,
                 available_memory_bytes().unwrap_or(512 * 1024 * 1024),
                 args.output_chunk_size.explicit_bytes(),

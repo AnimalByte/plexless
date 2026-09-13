@@ -1,6 +1,6 @@
 [package]
 name = "plexless"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "High-performance hierarchical FASTQ and unmapped CRAM demultiplexer"
 license = "MIT OR Apache-2.0"
@@ -26,7 +26,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 needletail = { version = "0.7.3", default-features = false, features = ["bzip2", "flate2", "zstd"] }
-flate2 = { version = "1.1.10", default-features = false, features = ["zlib"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 crossbeam-channel = "0.5"
 rapidgzip-core = "0.3.1"
 rust-htslib = { version = "1.0.1", default-features = false, features = ["bzip2", "lzma"] }
