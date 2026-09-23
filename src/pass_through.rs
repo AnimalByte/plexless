@@ -131,6 +131,8 @@ impl PassThroughSignature {
         })
     }
 
+    // Keep verification setup and register pressure off the common negative scan.
+    #[inline(never)]
     fn verify(&self, candidate: &[u8]) -> bool {
         let mut mismatches = 0u32;
         for (observed, chunk) in candidate.chunks(32).zip(self.verification.iter()) {
@@ -162,18 +164,21 @@ pub fn detect_pass_through(seq: &[u8], signature: &PassThroughSignature) -> Opti
     let scan_start = signature.anchor_offset;
     let scan_end = last_start + signature.anchor_offset + signature.anchor_len;
     let mut window = 0u64;
-    let mut valid = 0usize;
-    for (index, &base) in seq[scan_start..scan_end].iter().enumerate() {
+    let mut remaining = seq[scan_start..scan_end].iter();
+    // Track validity by the iterator's remaining length. This avoids advancing
+    // separate position and clean-base counters on every negative-path base.
+    let mut valid_at_remaining = remaining.len() - signature.anchor_len;
+    while let Some(&base) = remaining.next() {
         let code = BASE[base as usize];
         if code > 3 {
             window = 0;
-            valid = 0;
+            // No later complete clean anchor can fit if this subtraction fails.
+            valid_at_remaining = remaining.len().checked_sub(signature.anchor_len)?;
             continue;
         }
         window = ((window << 2) | u64::from(code)) & signature.anchor_mask;
-        valid += 1;
-        if valid >= signature.anchor_len && window == signature.anchor {
-            let anchor_start = scan_start + index + 1 - signature.anchor_len;
+        if window == signature.anchor && remaining.len() <= valid_at_remaining {
+            let anchor_start = scan_end - remaining.len() - signature.anchor_len;
             let distal_start = anchor_start - signature.anchor_offset;
             if signature.verify(&seq[distal_start..distal_start + signature.verification_len]) {
                 return Some(distal_start);

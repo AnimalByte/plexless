@@ -52,6 +52,7 @@ impl DemuxCounts {
         self.pass_through_bases += other.pass_through_bases;
     }
 
+    #[inline]
     pub(crate) fn biological_bounds(
         &mut self,
         routing: &RoutingTree,

@@ -10,6 +10,7 @@ import csv
 import gzip
 import hashlib
 import json
+import os
 import platform
 import random
 import shutil
@@ -44,6 +45,8 @@ def fixture(root, paired, positive, count, validation=False):
     known = [A, B] if paired else [A]
     expected = [[] for _ in known]
     handles = [(root / f"r{mate + 1}.fastq").open("w") for mate in range(len(known))]
+    pool = [] if validation else ["".join(rng.choices("ACGT", k=500)) for _ in range(4096)]
+    raw_quality = quality(REACH + 27)
     # Negative controls include known exact substrings with deliberately wrong
     # surrounding bases, partial motifs, and barcode-like sequence.
     for index in range(count):
@@ -53,7 +56,12 @@ def fixture(root, paired, positive, count, validation=False):
             if validation:
                 insert_len = SIZES[index % len(SIZES)]
                 bio = "".join(rng.choices("ACGT", k=insert_len))
-                if index >= len(SIZES):
+                if index >= 18:
+                    bio = "".join(rng.choices("ACGT", k=75 + mate * 50))
+                    passes = bool((index - 18) & (1 << mate))
+                    suffix = bio + distal + "AAAA" if passes else bio
+                    clean = bio
+                elif index >= len(SIZES):
                     # Each control retains an exact 16-base anchor-like motif
                     # but never the complete assigned distal structure.
                     bio = "G" * 30 + rc(opposite)[:16] + "C" * 30 + proximal[:8] + "T" * 30
@@ -66,12 +74,12 @@ def fixture(root, paired, positive, count, validation=False):
                 # Equal raw lengths in positive/negative benchmarks. 50% of
                 # molecules reach distal structure; each PE mate is independent.
                 insert_len = 100 + mate * 35 if positive and (index + mate) % 2 == 0 else 500
-                bio = "".join(rng.choices("ACGT", k=insert_len))
+                bio = pool[(index * 7 + mate * 103) % len(pool)][:insert_len]
                 suffix = (bio + distal + "A" * REACH)[:REACH]
                 clean = bio if insert_len + len(distal) <= REACH else suffix
             seq = proximal + "NNN" + suffix
             name = f"r{index:09d}" + (f"/{mate + 1}" if paired else "")
-            handles[mate].write(record(name, seq))
+            handles[mate].write(record(name, seq) if validation else f"@{name}\n{seq}\n+\n{raw_quality}\n")
             if validation:
                 start = len(proximal) + 3
                 expected[mate].append(f"@{name}\n{clean}\n+\n{quality(len(seq))[start:start + len(clean)]}\n")
@@ -116,42 +124,78 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--with-cram", action="store_true")
+    parser.add_argument("--reuse-fixtures", type=Path, help="Reuse benchmark input from a completed run with the same record count")
     args = parser.parse_args()
     if min(args.records, args.repeats, args.threads) < 1:
         parser.error("records, repeats, and threads must be positive")
     args.binary = args.binary.resolve()
     if args.baseline:
         args.baseline = args.baseline.resolve()
+    if args.reuse_fixtures:
+        args.reuse_fixtures = args.reuse_fixtures.resolve()
+        previous = json.loads((args.reuse_fixtures / "summary.json").read_text())
+        if previous["records_or_pairs"] != args.records or previous["raw_read_length"] != REACH + 27:
+            parser.error("reused fixtures must have the same record count and read length")
     root = args.work_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     converter = args.binary.parent / "examples/make_unmapped_cram_fixture"
+    extractor = args.binary.parent / "examples/extract_cram_outputs_to_fastq"
     validation_cases = 0
     for paired in [False, True]:
         dataset = root / f"validation-{paired}"
-        expected = fixture(dataset, paired, True, 18, validation=True)
+        count = 22 if paired else 18
+        expected = fixture(dataset, paired, True, count, validation=True)
+        untrimmed = []
+        for mate in range(2 if paired else 1):
+            lines = (dataset / f"r{mate + 1}.fastq").read_text().splitlines()
+            untrimmed.append("".join(f"{lines[i]}\n{lines[i + 1][27:]}\n+\n{lines[i + 3][27:]}\n" for i in range(0, len(lines), 4)))
+        if args.with_cram:
+            cmd = [str(converter), "paired" if paired else "single", str(dataset / "r1.fastq")]
+            if paired:
+                cmd.append(str(dataset / "r2.fastq"))
+            subprocess.run(cmd + [str(dataset / "input.cram")], check=True, capture_output=True)
         for threads in [1, args.threads]:
             for mode in ["direct", "buffered"]:
-                output = root / "validation-output"
-                cmd = command(args.binary, dataset, output, paired, threads) + ["--output-mode", mode]
-                result = subprocess.run(cmd, capture_output=True, check=True)
-                (root / f"validation-{paired}-{threads}-{mode}.stderr").write_bytes(result.stderr)
-                for mate, truth in enumerate(expected):
-                    filename = f"s_R{mate + 1}.fastq.gz" if paired else "s.fastq.gz"
-                    with gzip.open(output / filename, "rt") as stream:
-                        actual = stream.read()
-                    if actual != truth:
-                        raise AssertionError(f"Exact sequence/quality/name truth mismatch: {paired=} {threads=} {mode=} {mate=}")
-                    validation_cases += len(SIZES) * 2
-                shutil.rmtree(output)
+                for source in ["fastq", "cram-fastq", "cram-cram"] if args.with_cram else ["fastq"]:
+                    if source == "cram-cram" and mode == "buffered":
+                        continue
+                    for disabled in [False, True]:
+                        output = root / "validation-output"
+                        cmd = command(args.binary, dataset, output, paired, threads, disabled, source != "fastq") + ["--output-mode", mode]
+                        if source == "cram-cram":
+                            cmd[cmd.index("--output-format") + 1] = "cram"
+                        result = subprocess.run(cmd, capture_output=True, check=True)
+                        (root / f"validation-{paired}-{threads}-{mode}-{source}-{disabled}.stderr").write_bytes(result.stderr)
+                        decoded = root / "decoded"
+                        if source == "cram-cram":
+                            subprocess.run([str(extractor), "paired" if paired else "single", str(output), str(decoded)], capture_output=True, check=True)
+                            if shutil.which("samtools"):
+                                subprocess.run(["samtools", "quickcheck", "-u", str(output / "s.cram")], check=True)
+                        for mate, truth in enumerate(untrimmed if disabled else expected):
+                            if source != "fastq" and paired:
+                                lines = truth.splitlines()
+                                for i in range(0, len(lines), 4):
+                                    lines[i] = lines[i].removesuffix(f"/{mate + 1}")
+                                truth = "\n".join(lines) + "\n"
+                            filename = f"s_R{mate + 1}.fastq.gz" if paired else "s.fastq.gz"
+                            with gzip.open((decoded if source == "cram-cram" else output) / filename, "rt") as stream:
+                                actual = stream.read()
+                            if actual != truth:
+                                raise AssertionError(f"Exact sequence/quality/name truth mismatch: {paired=} {threads=} {mode=} {mate=} {source=} {disabled=}")
+                            validation_cases += count
+                        if source == "cram-cram":
+                            shutil.rmtree(decoded)
+                        shutil.rmtree(output)
     print(f"Exact synthetic truth checks passed: {validation_cases}", flush=True)
     if not args.baseline:
         return
     rows = []
     for paired in [False, True]:
         for positive in [False, True]:
-            dataset = root / f"bench-{paired}-{positive}"
-            fixture(dataset, paired, positive, args.records)
-            if args.with_cram:
+            dataset = (args.reuse_fixtures or root) / f"bench-{paired}-{positive}"
+            if not args.reuse_fixtures:
+                fixture(dataset, paired, positive, args.records)
+            if args.with_cram and not args.reuse_fixtures:
                 cmd = [str(converter), "paired" if paired else "single", str(dataset / "r1.fastq")]
                 if paired:
                     cmd.append(str(dataset / "r2.fastq"))
@@ -168,6 +212,14 @@ def main():
                         start = time.perf_counter()
                         result = subprocess.run(cmd, capture_output=True, check=True)
                         seconds = time.perf_counter() - start
+                        if state == "enabled":
+                            hits1 = (args.records + 1) // 2 if positive else 0
+                            hits2 = args.records // 2 if positive and paired else 0
+                            negatives = args.records * (2 if paired else 1) - hits1 - hits2
+                            for metric, value in [("pass-through R1", hits1), ("pass-through R2", hits2), ("no pass-through (scanned mates)", negatives)]:
+                                assert f"  {metric}: {value}\n".encode() in result.stderr, f"Incorrect benchmark detection count: {metric}"
+                        if state == "disabled":
+                            assert b"  no pass-through (scanned mates): 0\n" in result.stderr
                         name = f"{'cram' if cram else 'fastq'}-{'pe' if paired else 'se'}-{positive}-{state}-{repetition}"
                         (root / f"{name}.stderr").write_bytes(result.stderr)
                         if repetition == 0:
@@ -184,7 +236,7 @@ def main():
                 else:
                     assert hashes["baseline"] != hashes["enabled"], "Positive control was not trimmed"
     with (root / "timings.csv").open("w") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     summaries = []
@@ -199,7 +251,7 @@ def main():
                     summaries.append(dict(format=fmt, mode=mode, positive=positive, state=state, median_seconds=median,
                                           reads_per_second=args.records * (2 if mode == "PE" else 1) / median,
                                           throughput_change_percent=(baseline / median - 1) * 100, min_seconds=min(times), max_seconds=max(times)))
-    report = dict(platform=platform.platform(), threads=args.threads, records_or_pairs=args.records, repeats=args.repeats,
+    report = dict(platform=platform.platform(), cpu_affinity=sorted(os.sched_getaffinity(0)), threads=args.threads, records_or_pairs=args.records, repeats=args.repeats,
                   raw_read_length=REACH + 27, positive_fraction=0.5, validation_checks=validation_cases,
                   binary_sha256=hashlib.sha256(args.binary.read_bytes()).hexdigest(), baseline_sha256=hashlib.sha256(args.baseline.read_bytes()).hexdigest(), results=summaries)
     (root / "summary.json").write_text(json.dumps(report, indent=2) + "\n")

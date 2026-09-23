@@ -361,3 +361,86 @@ fn corrected_assignment_uses_canonical_distal_and_unassigned_is_not_scanned() {
         assert!(String::from_utf8_lossy(&result.stderr).contains("pass-through R1: 1"));
     }
 }
+
+#[test]
+fn pe_false_anchor_candidates_do_not_hide_later_distal_or_affect_other_mate() {
+    let test = TestDir::new("pass-through-pe-false-anchors");
+    let b = "GCTACAGTTCGATACCGTGATCAG";
+    let barcodes = test.write(
+        "barcodes.tsv",
+        &format!("Set\tID\tSequence\nA\ta\t{A}\nB\tb\t{b}\n"),
+    );
+    let samples = test.write("samples.tsv", "Sample\tA\tB\ns\ta\tb\n");
+    let distal1 = format!("NNN{}", rc(b));
+    let distal2 = format!("NNN{}", rc(A));
+    let mut bio1 = "GATTACA".to_string();
+    // Move one observed N through each known position. Some variants break
+    // the chosen anchor; the others keep it exact but must fail verification.
+    // This exercises the behavior without depending on which anchor is chosen.
+    for position in 3..distal1.len() {
+        let mut fake = distal1.clone().into_bytes();
+        fake[position] = b'N';
+        bio1.push_str(&String::from_utf8(fake).unwrap());
+        bio1.push_str("GGGGGGG");
+    }
+    let p1 = format!("{A}NNN");
+    let p2 = format!("{b}NNN");
+    let inputs1 = [format!("{p1}{bio1}"), format!("{p1}{bio1}{distal1}AAAA")];
+    let inputs2 = [format!("{p2}CCTAGG{distal2}AAAA"), format!("{p2}CCTAGG")];
+    let r1 = test.write(
+        "r1.fastq",
+        &(fastq("pair0/1", &inputs1[0]) + &fastq("pair1/1", &inputs1[1])),
+    );
+    let r2 = test.write(
+        "r2.fastq",
+        &(fastq("pair0/2", &inputs2[0]) + &fastq("pair1/2", &inputs2[1])),
+    );
+    for threads in [1, 4] {
+        for mode in ["direct", "buffered"] {
+            let out = test.child(&format!("out-{threads}-{mode}"));
+            let result = Command::new(env!("CARGO_BIN_EXE_plexless"))
+                .args([
+                    "--threads",
+                    &threads.to_string(),
+                    "demux",
+                    "--r1-structure",
+                    "R1_24A3T",
+                    "--r2-structure",
+                    "R2_24B3T",
+                    "--output-mode",
+                    mode,
+                ])
+                .arg("--r1")
+                .arg(&r1)
+                .arg("--r2")
+                .arg(&r2)
+                .arg("--barcodes")
+                .arg(&barcodes)
+                .arg("--samples")
+                .arg(&samples)
+                .arg("--output")
+                .arg(&out)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let expected1: String = inputs1
+                .iter()
+                .enumerate()
+                .map(|(i, raw)| {
+                    expected_record(&format!("pair{i}/1"), raw, p1.len(), p1.len() + bio1.len())
+                })
+                .collect();
+            let expected2: String = inputs2
+                .iter()
+                .enumerate()
+                .map(|(i, raw)| expected_record(&format!("pair{i}/2"), raw, p2.len(), p2.len() + 6))
+                .collect();
+            assert_eq!(read_gzip_text(&out.join("s_R1.fastq.gz")), expected1);
+            assert_eq!(read_gzip_text(&out.join("s_R2.fastq.gz")), expected2);
+        }
+    }
+}

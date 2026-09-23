@@ -6,7 +6,11 @@
 and order for 50/75/100/150/200/250/300/400/500-base inserts, sequencing reach of
 350 bases beyond the proximal prefix, and negative controls with barcode-like,
 anchor-like, and partial distal sequences. SE/PE run with both output modes and
-one/four threads. Focused Rust tests additionally cover false-anchor recovery,
+one/four threads, with detection both enabled and disabled. With `--with-cram`,
+the same truth checks run on CRAM-to-FASTQ and reopened native CRAM output, with
+independent `samtools quickcheck` when available. PE includes neither/R1-only/
+R2-only/both read-through cases. The complete matrix checks 1,240 output records.
+Focused Rust tests additionally cover false-anchor recovery,
 sample specificity, overrides, `(rc)`, repeated pieces, technical masks, chunked
 verification, disable behavior, and native CRAM metadata.
 
@@ -27,7 +31,9 @@ baseline, the new binary with `--no-pass-through`, and default-on detection,
 each on zero and 50% pass-through inputs. Raw read lengths are identical. CRAM
 input is measured separately, using the existing fixture converter and FASTQ
 output. Runs warm each state once and rotate order between repetitions; report
-medians and ranges, not just the fastest run. Rates count individual reads
+medians and ranges, not just the fastest run. For repeatable measurements on a
+hybrid CPU, use `taskset` to select homogeneous cores; affinity is recorded in
+the report. Benchmarks use a seeded 4,096-insert sequence pool. Rates count individual reads
 (twice the pair count for PE). Disabled output must hash identically to baseline;
 enabled negative output must also match. Positive output must differ.
 

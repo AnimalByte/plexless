@@ -25,6 +25,7 @@ an established workflow before using it in production or clinical pipelines.
 - Parent-local handling of observed `N` bases
 - Child sequence reuse across independent parent namespaces
 - Structured-prefix trimming for assigned reads
+- Default-on sample-specific distal pass-through trimming, independently per mate
 - Optional unassigned output and separate biological/barcode FASTQ statistics
 - Paired-read ID validation, bounded resynchronization, and orphan handling
 - Bounded multithreaded parsing, demultiplexing, compression, and ordered output
@@ -44,6 +45,11 @@ reads; paired-end (PE) runs contain 10 million read pairs. Both tools used gzip
 compression level 2. Plexless used the portable release build
 (`cargo build --release`), without `-C target-cpu=native`, and was compared
 against fqtk 0.4.0.
+
+These historical measurements predate default-on distal pass-through scanning.
+See the [v0.6.0 benchmark report](docs/pass-through-validation.md) for the current
+baseline/disabled/enabled comparison; do not assume the historical rates include
+the new scan.
 
 | Mode | Samples | Plexless | fqtk | Plexless speed vs fqtk |
 | --- | ---: | ---: | ---: | ---: |
@@ -408,6 +414,9 @@ The completion summary adds detected R1/SE and R2 counts, scanned mates with no
 detection, and distal bases removed (including trailing sequence). Disabled or
 unavailable ends are not counted as scanned negatives. Existing structured QC
 formats are unchanged; output sample base counts reflect final trimmed reads.
+
+See the [v0.6.0 validation and performance report](docs/pass-through-validation.md)
+for tests, reproducible benchmark results, and the measured default scanning cost.
 
 ### Barcode whitelist
 
