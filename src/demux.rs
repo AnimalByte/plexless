@@ -11,6 +11,7 @@ use crate::output::{
     OutputLayout, ResolvedOutputMode, available_memory_bytes, calculate_fastq_output_buffer_policy,
     report_output_mode, resolve_output_mode,
 };
+use crate::pass_through::{BiologicalBounds, PassThroughPlans, detect_pass_through};
 use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
 use crate::stats::{FastqStats, MateQcStats};
@@ -31,6 +32,9 @@ pub(crate) struct DemuxCounts {
     pub(crate) short_reads: u64,
     pub(crate) orphan_r1: u64,
     pub(crate) orphan_r2: u64,
+    pub(crate) pass_through: [u64; 2],
+    pub(crate) no_pass_through: u64,
+    pub(crate) pass_through_bases: u64,
 }
 
 impl DemuxCounts {
@@ -42,6 +46,31 @@ impl DemuxCounts {
         self.short_reads += other.short_reads;
         self.orphan_r1 += other.orphan_r1;
         self.orphan_r2 += other.orphan_r2;
+        self.pass_through[0] += other.pass_through[0];
+        self.pass_through[1] += other.pass_through[1];
+        self.no_pass_through += other.no_pass_through;
+        self.pass_through_bases += other.pass_through_bases;
+    }
+
+    pub(crate) fn biological_bounds(
+        &mut self,
+        routing: &RoutingTree,
+        sample: u32,
+        mate: usize,
+        seq: &[u8],
+        start: usize,
+    ) -> BiologicalBounds {
+        let mut end = seq.len();
+        if let Some(signature) = routing.pass_through.signature(sample, mate) {
+            if let Some(relative) = detect_pass_through(&seq[start..], signature) {
+                end = start + relative;
+                self.pass_through[mate] += 1;
+                self.pass_through_bases += (seq.len() - end) as u64;
+            } else {
+                self.no_pass_through += 1;
+            }
+        }
+        BiologicalBounds { start, end }
     }
 }
 
@@ -121,7 +150,8 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
 
     let samples = SampleSheet::load(&args.samples, &layout, &catalog)?;
 
-    let routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
+    let mut routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
+    routing.pass_through = PassThroughPlans::compile(&layout, &catalog, &samples, &args)?;
 
     let output_dir = args.output.clone();
     let output_layout = OutputLayout::new(samples.samples.len(), paired, args.write_unassigned);
@@ -303,9 +333,10 @@ fn run_single(
             RouteResult::Assigned { sample_id } => {
                 counts.assigned += 1;
 
-                let trimmed_seq = &seq[prefix_len..];
+                let bounds = counts.biological_bounds(routing, sample_id, 0, seq, prefix_len);
+                let trimmed_seq = &seq[bounds.range()];
 
-                let trimmed_qual = &qual[prefix_len..];
+                let trimmed_qual = &qual[bounds.range()];
 
                 writer.write_sample(
                     sample_id,
@@ -514,20 +545,23 @@ fn process_pair_parts(
         RouteResult::Assigned { sample_id } => {
             counts.assigned += 1;
 
+            let r1_bounds = counts.biological_bounds(routing, sample_id, 0, r1_seq, r1_prefix);
+            let r2_bounds = counts.biological_bounds(routing, sample_id, 1, r2_seq, r2_prefix);
+
             writer.write_sample(
                 sample_id,
                 OutputMate::R1,
                 r1_id,
-                &r1_seq[r1_prefix..],
-                &r1_qual[r1_prefix..],
+                &r1_seq[r1_bounds.range()],
+                &r1_qual[r1_bounds.range()],
             )?;
 
             writer.write_sample(
                 sample_id,
                 OutputMate::R2,
                 r2_id,
-                &r2_seq[r2_prefix..],
-                &r2_qual[r2_prefix..],
+                &r2_seq[r2_bounds.range()],
+                &r2_qual[r2_bounds.range()],
             )?;
         }
 
@@ -986,6 +1020,16 @@ pub(crate) fn print_summary(counts: &DemuxCounts) {
     eprintln!("  unmatched:  {}", counts.unmatched);
     eprintln!("  ambiguous:  {}", counts.ambiguous);
     eprintln!("  unrouted:   {}", counts.unrouted);
+    eprintln!("  pass-through R1: {}", counts.pass_through[0]);
+    eprintln!("  pass-through R2: {}", counts.pass_through[1]);
+    eprintln!(
+        "  no pass-through (scanned mates): {}",
+        counts.no_pass_through
+    );
+    eprintln!(
+        "  pass-through bases removed: {}",
+        counts.pass_through_bases
+    );
 
     if counts.short_reads > 0 {
         eprintln!("  short reads: {}", counts.short_reads);

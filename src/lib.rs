@@ -9,6 +9,7 @@ pub(crate) mod input;
 pub(crate) mod output;
 pub(crate) mod parallel;
 pub(crate) mod parallel_input;
+pub mod pass_through;
 pub(crate) mod qc;
 pub mod routing;
 pub mod samples;

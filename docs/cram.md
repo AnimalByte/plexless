@@ -55,12 +55,12 @@ record or its mate is trimmed:
 | --- | --- | --- |
 | QNAME; paired/READ1/READ2/unmapped, duplicate, and QC-fail flags; RG, BC, QT, RX, QX, MI | Preserve | The demultiplexing transformation does not alter their defined value |
 | Unknown/nonstandard auxiliary tags | Preserve | Plexless cannot infer private semantics |
-| `OQ`, `BQ`, `E2`, `U2` | Rewrite | Trim the position-for-position sequence/quality string by the same prefix; a wrong type or pre-trim length fails the run |
+| `OQ`, `BQ`, `E2`, `U2` | Rewrite | Slice the position-for-position sequence/quality string using the same proximal and distal boundaries; a wrong type or pre-trim length fails the run |
 | `R2`, `Q2` | Rewrite when the represented mate was trimmed | Replace with the transformed mate sequence or Phred+33 quality string |
 | `MM`, `ML`, `MN` | Remove | Base-modification coordinates/probabilities cannot be safely repaired in v1 |
 | `MD`, `NM`, `SA`, `MC`, `AS`, `XS`, `UQ`, `MQ`, `AM`, `SM`, `CM`, `NH`, `HI`, `IH`, `CC`, `CP`, `CG`, `H0`, `H1`, `H2`, `PQ`, `TS` | Remove | Current alignment/mapping-derived values are invalid or meaningless after an intentional sequence change |
 | `OA`, `OC`, `OP`; `CS`, `CQ`, `FZ`; `FI`, `FS`, `TC`; other defined barcode/library/program tags | Preserve | These describe historical/original data, technology metadata, template structure, or provenance rather than a current per-base alignment |
-| `PT` | Remove | Local-coordinate annotation can be invalidated by prefix trimming |
+| `PT` | Remove | Local-coordinate annotation can be invalidated by proximal or distal trimming |
 
 The preserve/rewrite/remove decision is aggregate-counted by tag in
 `cram_metadata.tsv` and summarized once per run. It is never logged once per

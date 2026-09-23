@@ -209,6 +209,22 @@ pub struct DemuxArgs {
     #[arg(long, default_value_t = 1)]
     pub max_mismatches: u8,
 
+    /// Disable distal pass-through detection (retain proximal-only trimming)
+    #[arg(long)]
+    pub no_pass_through: bool,
+
+    /// Distal Hamming mismatch budget outside the exact anchor (independent of barcode correction)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=2))]
+    pub pass_through_mismatches: u8,
+
+    /// Override R1 distal structure in observed orientation, e.g. R1_12A(rc)4T
+    #[arg(long, conflicts_with = "no_pass_through")]
+    pub r1_distal_structure: Option<String>,
+
+    /// Override R2 distal structure in observed orientation; requires paired input
+    #[arg(long, conflicts_with = "no_pass_through")]
+    pub r2_distal_structure: Option<String>,
+
     /// Write biological-read and barcode-region FASTQ statistics
     #[arg(long)]
     pub fastq_stats: bool,

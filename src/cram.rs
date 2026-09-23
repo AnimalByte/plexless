@@ -20,6 +20,7 @@ use rust_htslib::htslib;
 use crate::cli::ReadMode;
 use crate::output::{OutputMate, OutputTarget};
 use crate::parallel::OwnedFastqRecord;
+use crate::pass_through::BiologicalBounds;
 use crate::samples::SampleSheet;
 use crate::writer::{build_sample_names, prepare_output_dir};
 
@@ -51,14 +52,14 @@ pub(crate) enum CramOutputItem {
     Single {
         target: OutputTarget,
         record: CramOwnedRecord,
-        trim_start: usize,
+        bounds: BiologicalBounds,
     },
     Pair {
         target: OutputTarget,
         r1: CramOwnedRecord,
         r2: CramOwnedRecord,
-        r1_trim: usize,
-        r2_trim: usize,
+        r1_bounds: BiologicalBounds,
+        r2_bounds: BiologicalBounds,
         r1_first: bool,
     },
     Orphan {
@@ -774,37 +775,43 @@ impl CramWriterManager {
         )?;
         match item {
             CramOutputItem::Single {
-                mut record,
-                trim_start,
-                ..
+                mut record, bounds, ..
             } => {
-                transform_record(&mut record, trim_start, None, None, &mut self.metadata)?;
+                transform_record(&mut record, bounds, None, None, &mut self.metadata)?;
                 self.write_record(target, &record.source)?;
             }
             CramOutputItem::Pair {
                 mut r1,
                 mut r2,
-                r1_trim,
-                r2_trim,
+                r1_bounds,
+                r2_bounds,
                 r1_first,
                 ..
             } => {
-                let r1_mate_seq = r2.read.seq[r2_trim..].to_vec();
-                let r1_mate_qual = r2.read.qual[r2_trim..].to_vec();
-                let r2_mate_seq = r1.read.seq[r1_trim..].to_vec();
-                let r2_mate_qual = r1.read.qual[r1_trim..].to_vec();
+                let r1_mate_seq = r2.read.seq[r2_bounds.range()].to_vec();
+                let r1_mate_qual = r2.read.qual[r2_bounds.range()].to_vec();
+                let r2_mate_seq = r1.read.seq[r1_bounds.range()].to_vec();
+                let r2_mate_qual = r1.read.qual[r1_bounds.range()].to_vec();
                 transform_record(
                     &mut r1,
-                    r1_trim,
-                    (r2_trim > 0).then_some(r1_mate_seq.as_slice()),
-                    (r2_trim > 0).then_some(r1_mate_qual.as_slice()),
+                    r1_bounds,
+                    r2_bounds
+                        .changed(r2.read.seq.len())
+                        .then_some(r1_mate_seq.as_slice()),
+                    r2_bounds
+                        .changed(r2.read.seq.len())
+                        .then_some(r1_mate_qual.as_slice()),
                     &mut self.metadata,
                 )?;
                 transform_record(
                     &mut r2,
-                    r2_trim,
-                    (r1_trim > 0).then_some(r2_mate_seq.as_slice()),
-                    (r1_trim > 0).then_some(r2_mate_qual.as_slice()),
+                    r2_bounds,
+                    r1_bounds
+                        .changed(r1.read.seq.len())
+                        .then_some(r2_mate_seq.as_slice()),
+                    r1_bounds
+                        .changed(r1.read.seq.len())
+                        .then_some(r2_mate_qual.as_slice()),
                     &mut self.metadata,
                 )?;
                 if r1_first {
@@ -816,7 +823,8 @@ impl CramWriterManager {
                 }
             }
             CramOutputItem::Orphan { mut record, .. } => {
-                transform_record(&mut record, 0, None, None, &mut self.metadata)?;
+                let bounds = BiologicalBounds::full(record.read.seq.len());
+                transform_record(&mut record, bounds, None, None, &mut self.metadata)?;
                 self.write_record(target, &record.source)?;
             }
         }
@@ -931,7 +939,7 @@ fn validate_output_target_owner(
     Ok(())
 }
 
-// Policy for an assigned record whose prefix is trimmed:
+// Policy for an assigned record trimmed at either biological boundary:
 // - OQ, BQ, E2, and U2 are position-for-position strings and are trimmed identically.
 // - R2 and Q2 are rewritten from the transformed mate when both mates exist.
 // - MM/ML/MN and alignment/position-dependent standard tags are removed because
@@ -945,12 +953,15 @@ const INVALIDATED_TAGS: [&[u8; 2]; 26] = [
 
 fn transform_record(
     record: &mut CramOwnedRecord,
-    trim_start: usize,
+    bounds: BiologicalBounds,
     mate_seq: Option<&[u8]>,
     mate_qual: Option<&[u8]>,
     stats: &mut MetadataStats,
 ) -> Result<(), String> {
-    if trim_start > record.read.seq.len() || trim_start > record.read.qual.len() {
+    if bounds.start > bounds.end
+        || bounds.end > record.read.seq.len()
+        || bounds.end > record.read.qual.len()
+    {
         return Err("Internal error: CRAM trim prefix exceeds record length".into());
     }
     let tags = record
@@ -965,9 +976,9 @@ fn transform_record(
 
     let mut rewritten = Vec::<[u8; 2]>::new();
     let mut removed = Vec::<[u8; 2]>::new();
-    if trim_start > 0 {
+    if bounds.changed(record.read.seq.len()) {
         for tag in [b"OQ", b"BQ", b"E2", b"U2"] {
-            if rewrite_trimmed_string(&mut record.source, tag, trim_start, record.read.seq.len())? {
+            if rewrite_trimmed_string(&mut record.source, tag, bounds, record.read.seq.len())? {
                 rewritten.push(*tag);
             }
         }
@@ -998,8 +1009,8 @@ fn transform_record(
         stats.observe(action, &tag)?;
     }
 
-    let seq = &record.read.seq[trim_start..];
-    let normalized_qual = &record.read.qual[trim_start..];
+    let seq = &record.read.seq[bounds.range()];
+    let normalized_qual = &record.read.qual[bounds.range()];
     let numeric_qual = normalized_qual
         .iter()
         .map(|quality| {
@@ -1016,7 +1027,7 @@ fn transform_record(
 fn rewrite_trimmed_string(
     record: &mut bam::Record,
     tag: &[u8; 2],
-    trim_start: usize,
+    bounds: BiologicalBounds,
     original_len: usize,
 ) -> Result<bool, String> {
     let Some(value) = aux_string(record, tag)? else {
@@ -1029,7 +1040,7 @@ fn rewrite_trimmed_string(
             value.len()
         ));
     }
-    rewrite_string(record, tag, &value.as_bytes()[trim_start..])?;
+    rewrite_string(record, tag, &value.as_bytes()[bounds.range()])?;
     Ok(true)
 }
 

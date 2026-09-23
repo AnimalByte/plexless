@@ -13,6 +13,108 @@ const SINGLE_UNMAPPED: u16 = 0x4;
 const PAIRED_R1_UNMAPPED: u16 = 0x1 | 0x4 | 0x8 | 0x40;
 const PAIRED_R2_UNMAPPED: u16 = 0x1 | 0x4 | 0x8 | 0x80;
 
+#[test]
+fn distal_bounds_reach_cram_fastq_and_metadata_writers() {
+    let test = TestDir::new("cram-pass-through");
+    let barcode = "ACGTTGCACTGATCGAGGTACCTA";
+    let opposite = "TAGGTACCTCGATCAGTGCAACGT";
+    let barcodes = test.write(
+        "barcodes.tsv",
+        &format!("Set\tID\tSequence\nA\ta\t{barcode}\nB\tb\t{barcode}\n"),
+    );
+    for paired in [false, true] {
+        let samples = test.write(
+            "samples.tsv",
+            if paired {
+                "Sample\tA\tB\ns\ta\tb\n"
+            } else {
+                "Sample\tA\ns\ta\n"
+            },
+        );
+        let seq1 = format!("{barcode}NNGATTACANN{opposite}AAAA");
+        let seq2 = format!("{barcode}NNCCTAGG");
+        let mut r1 = record(
+            b"molecule",
+            if paired {
+                PAIRED_R1_UNMAPPED
+            } else {
+                SINGLE_UNMAPPED
+            },
+            seq1.as_bytes(),
+            &vec![31; seq1.len()],
+        );
+        for tag in [b"OQ", b"BQ", b"E2", b"U2"] {
+            r1.push_aux(tag, Aux::String(&"I".repeat(seq1.len())))
+                .unwrap();
+        }
+        let mut records = vec![r1];
+        if paired {
+            let mut r2 = record(
+                b"molecule",
+                PAIRED_R2_UNMAPPED,
+                seq2.as_bytes(),
+                &vec![32; seq2.len()],
+            );
+            r2.push_aux(b"R2", Aux::String(&seq1)).unwrap();
+            r2.push_aux(b"Q2", Aux::String(&"@".repeat(seq1.len())))
+                .unwrap();
+            records.push(r2);
+        }
+        let cram = test.child(&format!("input-{paired}.cram"));
+        write_cram(&cram, &header(paired), &records);
+        for threads in [1, 4] {
+            for format in [OutputFormat::Fastq, OutputFormat::Cram] {
+                let out = test.child(&format!("out-{paired}-{threads}-{format:?}"));
+                let mut options = args(
+                    cram.clone(),
+                    out.clone(),
+                    barcodes.clone(),
+                    samples.clone(),
+                    if paired {
+                        ReadMode::Paired
+                    } else {
+                        ReadMode::Single
+                    },
+                    format,
+                );
+                options.structure = (!paired).then(|| "R1_24A2T".into());
+                options.r1_structure = paired.then(|| "R1_24A2T".into());
+                options.r2_structure = paired.then(|| "R2_24B2T".into());
+                plexless::demux::run_with_threads(options, threads).unwrap();
+                if format == OutputFormat::Fastq {
+                    let name = if paired {
+                        "s_R1.fastq.gz"
+                    } else {
+                        "s.fastq.gz"
+                    };
+                    let output = read_gzip_text(&out.join(name));
+                    let lines: Vec<_> = output.lines().collect();
+                    assert_eq!(lines[1], "GATTACA");
+                    assert_eq!(lines[3], "@@@@@@@");
+                    if paired {
+                        let output = read_gzip_text(&out.join("s_R2.fastq.gz"));
+                        let lines: Vec<_> = output.lines().collect();
+                        assert_eq!(lines[1], "CCTAGG");
+                        assert_eq!(lines[3], "AAAAAA");
+                    }
+                } else {
+                    let (_, output) = read_cram(&out.join("s.cram"));
+                    assert_eq!(output[0].seq().as_bytes(), b"GATTACA");
+                    assert_eq!(output[0].qual(), &[31; 7]);
+                    for tag in [b"OQ", b"BQ", b"E2", b"U2"] {
+                        assert_eq!(output[0].aux(tag).unwrap(), Aux::String("IIIIIII"));
+                    }
+                    if paired {
+                        assert_eq!(output[1].seq().as_bytes(), b"CCTAGG");
+                        assert_eq!(output[1].aux(b"R2").unwrap(), Aux::String("GATTACA"));
+                        assert_eq!(output[1].aux(b"Q2").unwrap(), Aux::String("@@@@@@@"));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn resources(test: &TestDir) -> (PathBuf, PathBuf) {
     let barcodes = test.write(
         "barcodes.tsv",
@@ -48,6 +150,10 @@ fn args(
         output_chunk_size: ByteSizeSetting::Auto,
         output_buffer_memory: ByteSizeSetting::Auto,
         max_open_files: None,
+        no_pass_through: false,
+        pass_through_mismatches: 1,
+        r1_distal_structure: None,
+        r2_distal_structure: None,
         max_mismatches: 1,
         fastq_stats: true,
         write_unassigned: true,

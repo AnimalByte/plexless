@@ -300,7 +300,7 @@ fn build_correction_index(
     Ok(corrected)
 }
 
-fn hamming_distance(a: u64, b: u64) -> u8 {
+pub(crate) fn hamming_distance(a: u64, b: u64) -> u8 {
     let diff = a ^ b;
     let mismatch_bits = (diff | (diff >> 1)) & 0x5555_5555_5555_5555;
     u8::try_from(mismatch_bits.count_ones())

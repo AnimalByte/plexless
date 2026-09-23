@@ -1,5 +1,42 @@
 # FASTQ and unmapped-CRAM qualification
 
+## Pass-through qualification and timing
+
+`run_pass_through_validation.py` checks exact cleaned sequence, quality, names,
+and order for 50/75/100/150/200/250/300/400/500-base inserts, sequencing reach of
+350 bases beyond the proximal prefix, and negative controls with barcode-like,
+anchor-like, and partial distal sequences. SE/PE run with both output modes and
+one/four threads. Focused Rust tests additionally cover false-anchor recovery,
+sample specificity, overrides, `(rc)`, repeated pieces, technical masks, chunked
+verification, disable behavior, and native CRAM metadata.
+
+Save a release build from the baseline revision before building the new binary,
+then run (work directory must not already exist):
+
+```bash
+cargo build --release --examples
+cargo build --release
+python3 scripts/validation/run_pass_through_validation.py \
+  --binary target/release/plexless --baseline /path/to/baseline/plexless \
+  --work-dir /tmp/plexless-pass-through-results \
+  --records 300000 --repeats 5 --threads 4 --with-cram
+```
+
+Omit `--baseline` for correctness-only qualification. Benchmark states are the
+baseline, the new binary with `--no-pass-through`, and default-on detection,
+each on zero and 50% pass-through inputs. Raw read lengths are identical. CRAM
+input is measured separately, using the existing fixture converter and FASTQ
+output. Runs warm each state once and rotate order between repetitions; report
+medians and ranges, not just the fastest run. Rates count individual reads
+(twice the pair count for PE). Disabled output must hash identically to baseline;
+enabled negative output must also match. Positive output must differ.
+
+`summary.json` and `timings.csv` retain environment, binary hashes, wall time,
+throughput, and percentage changes. Timings include decoding and gzip output;
+positive gains include reduced output work and do not measure scanner cost in
+isolation. Generated inputs and transient output stay outside Git. This focused
+benchmark complements, rather than replaces, the existing deep-validation suite.
+
 These scripts provide deterministic, self-contained correctness and
 concurrency qualification for the existing FASTQ implementation. Generated
 data and outputs default below `$HOME/plexless_validation_data`; they are not

@@ -25,6 +25,7 @@ use crate::output::{
     calculate_output_buffer_policy, report_output_mode, resolve_output_mode,
 };
 use crate::parallel_input::ParallelInput;
+use crate::pass_through::{BiologicalBounds, PassThroughPlans};
 use crate::qc::{SampleQc, SampleQcSummary};
 use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
@@ -1196,7 +1197,7 @@ struct ProcessedBatch {
 struct ReferencedOutput {
     key: OutputKey,
     record: BatchFastqRecordRef,
-    trim_start: usize,
+    bounds: BiologicalBounds,
 }
 
 #[derive(Debug)]
@@ -1295,14 +1296,17 @@ impl BatchBuffers {
         target: OutputTarget,
         mate: OutputMate,
         record: &OwnedFastqRecord,
-        trim_start: usize,
+        bounds: BiologicalBounds,
     ) -> Result<(), String> {
-        if trim_start > record.seq.len() || trim_start > record.qual.len() {
+        if bounds.start > bounds.end
+            || bounds.end > record.seq.len()
+            || bounds.end > record.qual.len()
+        {
             return Err("Internal error: trim prefix exceeds FASTQ record length".into());
         }
 
-        let seq = &record.seq[trim_start..];
-        let qual = &record.qual[trim_start..];
+        let seq = &record.seq[bounds.range()];
+        let qual = &record.qual[bounds.range()];
 
         if seq.len() != qual.len() {
             return Err("Sequence and quality lengths do not match".into());
@@ -1692,15 +1696,15 @@ impl CramSerialFastqWriter {
         target: OutputTarget,
         mate: OutputMate,
         record: &OwnedFastqRecord,
-        trim_start: usize,
+        bounds: BiologicalBounds,
     ) -> Result<(), String> {
         let seq = record
             .seq
-            .get(trim_start..)
+            .get(bounds.range())
             .ok_or("Internal error: CRAM FASTQ trim exceeds sequence length")?;
         let qual = record
             .qual
-            .get(trim_start..)
+            .get(bounds.range())
             .ok_or("Internal error: CRAM FASTQ trim exceeds quality length")?;
         match (self, target) {
             (Self::Direct(writer), OutputTarget::Sample { sample_id }) => {
@@ -1786,9 +1790,9 @@ fn run_cram_fastq_serial(
             if let Some(stats) = r1_stats.as_mut() {
                 stats.update(&record.read.seq, &record.read.qual)?;
             }
-            let (target, trim_start) = route_single_record(&record.read, &state, &mut counts)?;
+            let (target, bounds) = route_single_record(&record.read, &state, &mut counts)?;
             if should_emit(target, state.write_unassigned) {
-                writer.write(target, OutputMate::Single, &record.read, trim_start)?;
+                writer.write(target, OutputMate::Single, &record.read, bounds)?;
             }
             Ok(())
         }
@@ -1799,11 +1803,11 @@ fn run_cram_fastq_serial(
             if let Some(stats) = r2_stats.as_mut() {
                 stats.update(&r2.read.seq, &r2.read.qual)?;
             }
-            let (target, r1_trim, r2_trim) =
+            let (target, r1_bounds, r2_bounds) =
                 route_pair_records(&r1.read, &r2.read, &state, &mut counts)?;
             if should_emit(target, state.write_unassigned) {
-                writer.write(target, OutputMate::R1, &r1.read, r1_trim)?;
-                writer.write(target, OutputMate::R2, &r2.read, r2_trim)?;
+                writer.write(target, OutputMate::R1, &r1.read, r1_bounds)?;
+                writer.write(target, OutputMate::R2, &r2.read, r2_bounds)?;
             }
             Ok(())
         }
@@ -1826,7 +1830,12 @@ fn run_cram_fastq_serial(
                 }
             }
             if state.write_unassigned {
-                writer.write(OutputTarget::Unassigned, mate, &record.read, 0)?;
+                writer.write(
+                    OutputTarget::Unassigned,
+                    mate,
+                    &record.read,
+                    BiologicalBounds::full(record.read.seq.len()),
+                )?;
             }
             Ok(())
         }
@@ -1896,11 +1905,11 @@ fn run_cram_output_serial(
                 if let Some(stats) = r1_stats.as_mut() {
                     stats.update(&record.read.seq, &record.read.qual)?;
                 }
-                let (target, trim_start) = route_single_record(&record.read, &state, &mut counts)?;
+                let (target, bounds) = route_single_record(&record.read, &state, &mut counts)?;
                 should_emit(target, state.write_unassigned).then_some(CramOutputItem::Single {
                     target,
                     record,
-                    trim_start,
+                    bounds,
                 })
             }
             CramInputItem::Pair { r1, r2, r1_first } => {
@@ -1910,14 +1919,14 @@ fn run_cram_output_serial(
                 if let Some(stats) = r2_stats.as_mut() {
                     stats.update(&r2.read.seq, &r2.read.qual)?;
                 }
-                let (target, r1_trim, r2_trim) =
+                let (target, r1_bounds, r2_bounds) =
                     route_pair_records(&r1.read, &r2.read, &state, &mut counts)?;
                 should_emit(target, state.write_unassigned).then_some(CramOutputItem::Pair {
                     target,
                     r1,
                     r2,
-                    r1_trim,
-                    r2_trim,
+                    r1_bounds,
+                    r2_bounds,
                     r1_first,
                 })
             }
@@ -2097,7 +2106,8 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
 
     let catalog = BarcodeCatalog::load(&args.barcodes, &layout)?;
     let samples = SampleSheet::load(&args.samples, &layout, &catalog)?;
-    let routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
+    let mut routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
+    routing.pass_through = PassThroughPlans::compile(&layout, &catalog, &samples, &args)?;
     let (r1_qc, r2_qc) = MateQcStats::for_layout(&layout);
     let mut r1_stats = args.fastq_stats.then_some(r1_qc);
     let mut r2_stats = if args.fastq_stats { r2_qc } else { None };
@@ -3110,20 +3120,20 @@ fn process_cram_batch(batch: WorkBatch, state: &SharedState) -> Result<CramProce
                     outputs.push(CramOutputItem::Single {
                         target: route.0,
                         record,
-                        trim_start: route.1,
+                        bounds: route.1,
                     });
                 }
             }
             WorkItem::CramPair { r1, r2, r1_first } => {
-                let (target, r1_trim, r2_trim) =
+                let (target, r1_bounds, r2_bounds) =
                     route_pair_records(&r1.read, &r2.read, state, &mut counts)?;
                 if should_emit(target, state.write_unassigned) {
                     outputs.push(CramOutputItem::Pair {
                         target,
                         r1,
                         r2,
-                        r1_trim,
-                        r2_trim,
+                        r1_bounds,
+                        r2_bounds,
                         r1_first,
                     });
                 }
@@ -3464,18 +3474,14 @@ struct CramOutputObservation {
 
 fn describe_cram_output(item: &CramOutputItem) -> Result<CramOutputObservation, String> {
     let records = match item {
-        CramOutputItem::Single {
-            record, trim_start, ..
-        } => vec![(OutputMate::Single, record.read.seq.len() - trim_start)],
+        CramOutputItem::Single { bounds, .. } => vec![(OutputMate::Single, bounds.len())],
         CramOutputItem::Pair {
-            r1,
-            r2,
-            r1_trim,
-            r2_trim,
+            r1_bounds,
+            r2_bounds,
             ..
         } => vec![
-            (OutputMate::R1, r1.read.seq.len() - r1_trim),
-            (OutputMate::R2, r2.read.seq.len() - r2_trim),
+            (OutputMate::R1, r1_bounds.len()),
+            (OutputMate::R2, r2_bounds.len()),
         ],
         CramOutputItem::Orphan { mate, record, .. } => {
             vec![(*mate, record.read.seq.len())]
@@ -3760,12 +3766,17 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
                 }
 
                 if state.write_unassigned {
-                    buffers.push_record(OutputTarget::Unassigned, mate, &record, 0)?;
+                    buffers.push_record(
+                        OutputTarget::Unassigned,
+                        mate,
+                        &record,
+                        BiologicalBounds::full(record.seq.len()),
+                    )?;
                 }
             }
             WorkItem::BatchSingle(record) => {
                 let view = resolve_batch_record(&fastq_backings, record)?;
-                let (target, trim_start) = route_single_parts(view.seq, state, &mut counts)?;
+                let (target, bounds) = route_single_parts(view.seq, state, &mut counts)?;
                 if should_emit(target, state.write_unassigned) {
                     referenced_outputs.push(ReferencedOutput {
                         key: OutputKey {
@@ -3773,14 +3784,14 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
                             mate: OutputMate::Single,
                         },
                         record,
-                        trim_start,
+                        bounds,
                     });
                 }
             }
             WorkItem::BatchPair { r1, r2 } => {
                 let r1_view = resolve_batch_record(&fastq_backings, r1)?;
                 let r2_view = resolve_batch_record(&fastq_backings, r2)?;
-                let (target, r1_trim, r2_trim) =
+                let (target, r1_bounds, r2_bounds) =
                     route_pair_parts(r1_view.seq, r2_view.seq, state, &mut counts)?;
                 if should_emit(target, state.write_unassigned) {
                     referenced_outputs.push(ReferencedOutput {
@@ -3789,7 +3800,7 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
                             mate: OutputMate::R1,
                         },
                         record: r1,
-                        trim_start: r1_trim,
+                        bounds: r1_bounds,
                     });
                     referenced_outputs.push(ReferencedOutput {
                         key: OutputKey {
@@ -3797,7 +3808,7 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
                             mate: OutputMate::R2,
                         },
                         record: r2,
-                        trim_start: r2_trim,
+                        bounds: r2_bounds,
                     });
                 }
             }
@@ -3816,7 +3827,9 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
                             mate,
                         },
                         record,
-                        trim_start: 0,
+                        bounds: BiologicalBounds::full(
+                            resolve_batch_record(&fastq_backings, record)?.seq.len(),
+                        ),
                     });
                 }
             }
@@ -3855,10 +3868,10 @@ fn process_single_record(
     buffers: &mut BatchBuffers,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let (target, trim_start) = route_single_record(&record, state, counts)?;
+    let (target, bounds) = route_single_record(&record, state, counts)?;
 
     if should_emit(target, state.write_unassigned) {
-        buffers.push_record(target, OutputMate::Single, &record, trim_start)?;
+        buffers.push_record(target, OutputMate::Single, &record, bounds)?;
     }
 
     Ok(())
@@ -3871,11 +3884,11 @@ fn process_pair(
     buffers: &mut BatchBuffers,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let (target, r1_trim, r2_trim) = route_pair_records(&r1, &r2, state, counts)?;
+    let (target, r1_bounds, r2_bounds) = route_pair_records(&r1, &r2, state, counts)?;
 
     if should_emit(target, state.write_unassigned) {
-        buffers.push_record(target, OutputMate::R1, &r1, r1_trim)?;
-        buffers.push_record(target, OutputMate::R2, &r2, r2_trim)?;
+        buffers.push_record(target, OutputMate::R1, &r1, r1_bounds)?;
+        buffers.push_record(target, OutputMate::R2, &r2, r2_bounds)?;
     }
 
     Ok(())
@@ -3885,7 +3898,7 @@ fn route_single_record(
     record: &OwnedFastqRecord,
     state: &SharedState,
     counts: &mut DemuxCounts,
-) -> Result<(OutputTarget, usize), String> {
+) -> Result<(OutputTarget, BiologicalBounds), String> {
     route_single_parts(&record.seq, state, counts)
 }
 
@@ -3893,14 +3906,19 @@ fn route_single_parts(
     seq: &[u8],
     state: &SharedState,
     counts: &mut DemuxCounts,
-) -> Result<(OutputTarget, usize), String> {
+) -> Result<(OutputTarget, BiologicalBounds), String> {
     let route = if let Some(route) = state.routing.route_read(seq, None)? {
         route
     } else {
         counts.short_reads += 1;
         RouteResult::Unmatched
     };
-    Ok(route_to_output(route, state.r1_prefix, counts))
+    let bounds = if let RouteResult::Assigned { sample_id } = route {
+        counts.biological_bounds(&state.routing, sample_id, 0, seq, state.r1_prefix)
+    } else {
+        BiologicalBounds::full(seq.len())
+    };
+    Ok((route_to_target(route, counts), bounds))
 }
 
 fn route_pair_records(
@@ -3908,7 +3926,7 @@ fn route_pair_records(
     r2: &OwnedFastqRecord,
     state: &SharedState,
     counts: &mut DemuxCounts,
-) -> Result<(OutputTarget, usize, usize), String> {
+) -> Result<(OutputTarget, BiologicalBounds, BiologicalBounds), String> {
     route_pair_parts(&r1.seq, &r2.seq, state, counts)
 }
 
@@ -3917,34 +3935,30 @@ fn route_pair_parts(
     r2_seq: &[u8],
     state: &SharedState,
     counts: &mut DemuxCounts,
-) -> Result<(OutputTarget, usize, usize), String> {
+) -> Result<(OutputTarget, BiologicalBounds, BiologicalBounds), String> {
     let route = if let Some(route) = state.routing.route_read(r1_seq, Some(r2_seq))? {
         route
     } else {
         counts.short_reads += 1;
         RouteResult::Unmatched
     };
-    let assigned = matches!(route, RouteResult::Assigned { .. });
+    let (r1_bounds, r2_bounds) = if let RouteResult::Assigned { sample_id } = route {
+        (
+            counts.biological_bounds(&state.routing, sample_id, 0, r1_seq, state.r1_prefix),
+            counts.biological_bounds(&state.routing, sample_id, 1, r2_seq, state.r2_prefix),
+        )
+    } else {
+        (
+            BiologicalBounds::full(r1_seq.len()),
+            BiologicalBounds::full(r2_seq.len()),
+        )
+    };
     let target = route_to_target(route, counts);
-    Ok((
-        target,
-        if assigned { state.r1_prefix } else { 0 },
-        if assigned { state.r2_prefix } else { 0 },
-    ))
+    Ok((target, r1_bounds, r2_bounds))
 }
 
 fn should_emit(target: OutputTarget, write_unassigned: bool) -> bool {
     matches!(target, OutputTarget::Sample { .. }) || write_unassigned
-}
-
-fn route_to_output(
-    route: RouteResult,
-    assigned_prefix: usize,
-    counts: &mut DemuxCounts,
-) -> (OutputTarget, usize) {
-    let assigned = matches!(route, RouteResult::Assigned { .. });
-    let target = route_to_target(route, counts);
-    (target, if assigned { assigned_prefix } else { 0 })
 }
 
 fn route_to_target(route: RouteResult, counts: &mut DemuxCounts) -> OutputTarget {
@@ -4139,11 +4153,11 @@ fn ordered_coordinator_loop(
                 let record = resolve_batch_record(&fastq_backings, output.record)?;
                 let seq = record
                     .seq
-                    .get(output.trim_start..)
+                    .get(output.bounds.range())
                     .ok_or("Internal error: trim prefix exceeds FASTQ sequence length")?;
                 let qual = record
                     .qual
-                    .get(output.trim_start..)
+                    .get(output.bounds.range())
                     .ok_or("Internal error: trim prefix exceeds FASTQ quality length")?;
                 if seq.len() != qual.len() {
                     return Err("Sequence and quality lengths do not match".into());
@@ -4283,11 +4297,11 @@ fn accumulator_loop(
             let record = resolve_batch_record(&batch.fastq_backings, output.record)?;
             let seq = record
                 .seq
-                .get(output.trim_start..)
+                .get(output.bounds.range())
                 .ok_or("Internal error: trim prefix exceeds FASTQ sequence length")?;
             let qual = record
                 .qual
-                .get(output.trim_start..)
+                .get(output.bounds.range())
                 .ok_or("Internal error: trim prefix exceeds FASTQ quality length")?;
             if seq.len() != qual.len() {
                 return Err("Sequence and quality lengths do not match".into());
@@ -4584,11 +4598,11 @@ fn aggregate_processed_batch(
         let record = resolve_batch_record(&fastq_backings, output.record)?;
         let seq = record
             .seq
-            .get(output.trim_start..)
+            .get(output.bounds.range())
             .ok_or("Internal error: trim prefix exceeds FASTQ sequence length")?;
         let qual = record
             .qual
-            .get(output.trim_start..)
+            .get(output.bounds.range())
             .ok_or("Internal error: trim prefix exceeds FASTQ quality length")?;
         if seq.len() != qual.len() {
             return Err("Sequence and quality lengths do not match".into());
@@ -6396,7 +6410,7 @@ mod tests {
                 read: OwnedFastqRecord::new(id, b"A", b"I"),
                 source: Box::new(rust_htslib::bam::Record::new()),
             },
-            trim_start: 0,
+            bounds: BiologicalBounds::full(1),
         }
     }
 
@@ -6407,7 +6421,7 @@ mod tests {
                 read: OwnedFastqRecord::new(id, b"A", b"I"),
                 source: Box::new(rust_htslib::bam::Record::new()),
             },
-            trim_start: 0,
+            bounds: BiologicalBounds::full(1),
         }
     }
 
@@ -6593,6 +6607,10 @@ mod tests {
             output_buffer_memory: ByteSizeSetting::Bytes(4 * 1024 * 1024),
             max_open_files: Some(2),
             max_mismatches: 0,
+            no_pass_through: false,
+            pass_through_mismatches: 1,
+            r1_distal_structure: None,
+            r2_distal_structure: None,
             fastq_stats: true,
             write_unassigned: false,
             low_sample_fraction: 0.05,

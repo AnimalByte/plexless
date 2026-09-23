@@ -20,6 +20,30 @@ resynchronize, emitting records present in only one input as orphans. Assigned
 reads have each mate's declared structured prefix trimmed; unassigned and
 orphan reads remain untrimmed.
 
+Assigned reads then use startup-compiled `PassThroughPlans`, indexed directly by
+sample ID and mate. Compilation reverses segments from the existing extraction
+plans, reconstructing physical bases from the assigned canonical barcode pieces,
+or uses a validated optional distal override. SE assumes symmetric ends; PE uses
+the opposite mate's proximal geometry. Unknown technical segments retain their
+length and become expected-reference masks.
+
+`PassThroughSignature` stores a `u64` anchor/mask, `usize` anchor length and
+offset, boxed verification chunks, a `usize` verification length, and a `u8`
+mismatch limit. Each chunk reuses `EncodedBarcode` plus a two-bit known-position
+mask. The detector knows only a sequence slice and signature. Its N-safe rolling
+scan precomputes legal anchor bounds; only exact hits invoke the existing packed
+Hamming primitive. It returns `anchor_start - anchor_offset`, continuing after
+failed verification. Compilation, barcode lookup, and reverse complementation
+never occur per read. `--no-pass-through` leaves the plan table empty and bypasses
+the detector completely.
+
+Both serial and parallel route paths construct `BiologicalBounds { start, end }`
+only after assignment. All FASTQ adapters borrow sequence/quality using those
+coordinates; native CRAM also applies them to per-base and mate metadata.
+Per-worker distal counters merge into the existing completion summary. Input QC,
+classification, scheduling, compression, cancellation, and output order retain
+their existing contracts.
+
 `InputSource` keeps one-file CRAM separate from FASTQ's `Single`/`Paired`
 paths. Parallel buffered FASTQ input is copied once into immutable byte blocks;
 work items carry compact block/record descriptors rather than owned `id`/`seq`/

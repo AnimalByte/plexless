@@ -170,6 +170,10 @@ plexless demux --help
 | `--barcodes <TSV>` | Always | Barcode whitelist with `Set`, `ID`, and `Sequence` columns. |
 | `--samples <TSV>` | Always | Routing table with `Sample` first, followed by barcode-set columns. |
 | `--max-mismatches <0-2>` | No (`1`) | Maximum substitutions allowed at each routing node. Observed `N` positions consume this budget. |
+| `--no-pass-through` | No | Disable default-on distal read-through detection; retain proximal-only trimming. |
+| `--pass-through-mismatches <0-2>` | No (`1`) | Distal substitution budget, independent of barcode correction. The anchor must remain exact. |
+| `--r1-distal-structure <LAYOUT>` | No | Override inferred R1 distal geometry in observed orientation. |
+| `--r2-distal-structure <LAYOUT>` | No | Override inferred R2 distal geometry in observed orientation (PE only). |
 
 ¹ Paired input requires one or both mate structures. A mate without a structure
 is retained as biological sequence but supplies no barcode pieces.
@@ -341,6 +345,70 @@ For example, with `R1_2A2B` and `R2_2A2B`, R1 A sequence `AC`, and normalized
 R2 A sequence `GT`, logical A is `ACGT`. Asymmetric structures such as
 `R1_10A11B` plus `R2_10A(rc)` are supported.
 
+### Distal pass-through trimming
+
+Pass-through detection is enabled by default without configuration changes.
+After sample assignment, Plexless searches for that sample's expected opposite
+end and removes the complete distal structure and everything following it.
+This is structure-aware contamination removal, not generic adapter discovery or
+Phred/low-quality trimming. Assignment and correction categories are unchanged.
+
+For paired reads, R1 expects the opposite orientation of the physical R2 prefix,
+and R2 expects the opposite orientation of R1. For single-end reads, the default
+assumes **symmetric ends**: R1 expects the opposite orientation of its own prefix.
+Use an override for asymmetric SE geometry or disable detection when that
+assumption does not apply. Each PE mate is trimmed independently; lengths may
+differ and pairs are neither merged nor synchronized by overlap.
+
+Compilation uses the assigned canonical whitelist sequence and existing logical
+extraction plans, including repeated pieces across mates. It reverses physical
+segment order and inverts each piece's orientation. `T` remains unknown technical
+sequence: its length and reversed position are retained, but its bases are
+excluded from verification. No additional barcode database is used.
+
+A 12–16-base exact anchor is chosen from contiguous known assigned bases,
+preferring longer anchors and then greater dinucleotide diversity. Anchors must
+contain at least three different bases, six different dinucleotides, and no base
+over 75%. Ends without a qualifying anchor are reported as unavailable at
+startup; Plexless never falls back to short or low-complexity anchors. An absent
+opposite mate prefix can likewise make one PE end unavailable.
+
+A rolling 2-bit scan runs only on assigned biological suffixes. Full packed
+Hamming verification runs only at exact anchor hits, across **all** known distal
+positions using 32-base chunks. `--pass-through-mismatches` defaults to one
+substitution, independently of `--max-mismatches`; anchor substitutions are not
+tolerated. There is no indel tolerance. Observed N or malformed bases reset the
+anchor window and reject verification at known positions. Only expected `T`
+positions are masked. Failed candidates do not stop the scan.
+
+The trim point is the beginning of the whole distal structure, including
+technical bases before the anchor. Sequence and quality use identical final
+coordinates. Complete structure coverage is required: truncated distal
+structures remain untrimmed. Biological sequence indistinguishable from the
+complete expected structure can still trigger detection; inference is an
+assumption, not proof of molecule geometry.
+
+Generic optional overrides reuse the existing structure grammar:
+
+```bash
+# Observed distal order: complete logical B, 3 unknown bases, reverse-complement A
+plexless demux ... --r1-distal-structure 'R1_20B3T24A(rc)'
+# Restore proximal-only behavior, bypassing compilation and scanning entirely
+plexless demux ... --no-pass-through
+```
+
+Overrides describe the distal sequence **as encountered**, with no automatic
+whole-structure reversal. Each referenced symbol must already exist in the
+proximal layout and be consumed completely; repeated occurrences split that
+symbol's canonical logical sequence in occurrence order, with `(rc)` applied
+per piece. Symbols may be omitted or reordered. This changes no whitelist or
+sample-sheet format. R1/R2 overrides replace only their respective inference.
+
+The completion summary adds detected R1/SE and R2 counts, scanned mates with no
+detection, and distal bases removed (including trailing sequence). Disabled or
+unavailable ends are not counted as scanned negatives. Existing structured QC
+formats are unchanged; output sample base counts reflect final trimmed reads.
+
 ### Barcode whitelist
 
 The barcode file is tab-separated with this exact header:
@@ -426,13 +494,15 @@ header gains one uniquely named Plexless `@PG` entry. No CRAM index is created.
 See [CRAM metadata preservation](docs/cram.md#metadata-preservation-policy).
 
 Assigned reads have their declared structured prefixes removed independently
-from each mate. With `--write-unassigned`, unassigned and orphan records are
+from each mate, followed by default-on distal pass-through trimming as described
+below. With `--write-unassigned`, unassigned and orphan records are
 written untrimmed to corresponding `unassigned*.fastq.gz` files.
 Because those filenames are reserved, a worklist sample that sanitizes to
 `unassigned` is rejected when unassigned output is enabled.
 
 `--fastq-stats` writes two input-level QC reports. `fastq_stats.tsv` summarizes
-only the biological suffix after each mate's complete declared prefix.
+the input suffix after each mate's complete declared prefix, before distal
+trimming (these input-level reports retain their existing meaning).
 `barcode_stats.tsv` summarizes every physical barcode segment separately and
 identifies its mate, symbol, mate-local repeated-piece number, sequencer cycles,
 and declared orientation. Technical `T` segments are excluded from both
