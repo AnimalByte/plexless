@@ -13,6 +13,10 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    env:
+      # Keep optional system compression libraries out of the runtime requirements.
+      LZMA_API_STATIC: '1'
+      BZIP2_NO_PKG_CONFIG: '1'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -45,6 +49,12 @@ jobs:
           mkdir -p "$stage_dir" dist
           install -m 0755 target/release/plexless "$stage_dir/plexless"
           strip --strip-unneeded "$stage_dir/plexless"
+          while read -r library; do
+            case "$library" in
+              libc.so.6|libm.so.6|libgcc_s.so.1|libz.so.1|libpthread.so.0|libdl.so.2|librt.so.1|ld-linux-x86-64.so.2) ;;
+              *) echo "Unexpected runtime dependency: $library" >&2; exit 1 ;;
+            esac
+          done < <(objdump -p "$stage_dir/plexless" | awk '$1 == "NEEDED" {print $2}')
           cp README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md "$stage_dir/"
           cp -R docs licenses "$stage_dir/"
           {
