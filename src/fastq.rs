@@ -15,6 +15,9 @@ impl InputReader {
     }
 
     pub(crate) fn try_open(path: &Path) -> Result<Self, String> {
+        if path == Path::new("-") {
+            return Self::from_reader(std::io::stdin(), path);
+        }
         let parse_error = match parse_fastx_file(path) {
             Ok(reader) => return Ok(Self { reader }),
             Err(error) => error,

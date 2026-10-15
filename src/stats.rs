@@ -30,6 +30,9 @@ pub(crate) struct BarcodeSegmentStats {
 /// segments of one mate. Technical (`T`) segments are intentionally omitted.
 #[derive(Debug)]
 pub(crate) struct MateQcStats {
+    detailed: bool,
+    overrep: Option<crate::overrepresentation::Overrepresentation>,
+    distribution: crate::distribution::Distribution,
     prefix_len: usize,
     biological: FastqStats,
     barcode_segments: Vec<BarcodeSegmentStats>,
@@ -58,6 +61,9 @@ impl MateQcStats {
             .collect();
 
         Self {
+            detailed: false,
+            overrep: None,
+            distribution: Default::default(),
             prefix_len,
             biological: FastqStats::default(),
             barcode_segments,
@@ -83,7 +89,14 @@ impl MateQcStats {
         let biological_start = self.prefix_len.min(seq.len());
         self.biological
             .update_validated(&seq[biological_start..], &qual[biological_start..]);
+        if self.detailed {
+            self.distribution
+                .update(&seq[biological_start..], &qual[biological_start..]);
+        }
 
+        if let Some(overrep) = self.overrep.as_mut() {
+            overrep.update(&seq[biological_start..]);
+        }
         for segment in &mut self.barcode_segments {
             let start = segment.start.min(seq.len());
             let end = segment.end.min(seq.len());
@@ -95,6 +108,20 @@ impl MateQcStats {
         Ok(())
     }
 
+    pub(crate) fn enable_overrepresentation(&mut self, sampling: u32) {
+        self.overrep = Some(crate::overrepresentation::Overrepresentation::new(sampling));
+    }
+    pub(crate) fn overrepresentation(&self) -> serde_json::Value {
+        self.overrep
+            .as_ref()
+            .map_or(serde_json::Value::Null, |v| v.json())
+    }
+    pub(crate) fn enable_detailed(&mut self) {
+        self.detailed = true;
+    }
+    pub(crate) fn distribution(&self) -> &crate::distribution::Distribution {
+        &self.distribution
+    }
     pub(crate) fn biological(&self) -> &FastqStats {
         &self.biological
     }
@@ -106,15 +133,44 @@ impl MateQcStats {
 
 impl FastqStats {
     pub fn update(&mut self, seq: &[u8], qual: &[u8]) -> Result<(), String> {
+        self.update_with_low(seq, qual, 0).map(|_| ())
+    }
+
+    pub(crate) fn update_with_low(
+        &mut self,
+        seq: &[u8],
+        qual: &[u8],
+        threshold: u8,
+    ) -> Result<u64, String> {
         if seq.len() != qual.len() {
             return Err("Sequence and quality lengths do not match".into());
         }
-        validate_quality(qual)?;
-        self.update_validated(seq, qual);
-        Ok(())
+        if qual.iter().any(|&q| !(b'!'..=b'~').contains(&q)) {
+            return Err("Invalid FASTQ quality score".into());
+        }
+        Ok(self.scan(seq, qual, threshold))
+    }
+
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.reads += other.reads;
+        self.bases += other.bases;
+        if let Some(min) = other.min_length {
+            self.min_length = Some(self.min_length.map_or(min, |m| m.min(min)));
+        }
+        self.max_length = self.max_length.max(other.max_length);
+        self.gc_bases += other.gc_bases;
+        self.n_bases += other.n_bases;
+        self.quality_sum += other.quality_sum;
+        self.q20_bases += other.q20_bases;
+        self.q30_bases += other.q30_bases;
     }
 
     fn update_validated(&mut self, seq: &[u8], qual: &[u8]) {
+        self.scan(seq, qual, 0);
+    }
+
+    fn scan(&mut self, seq: &[u8], qual: &[u8], threshold: u8) -> u64 {
+        let mut low = 0;
         let length = seq.len();
 
         // Cheap values: no sequence scan required.
@@ -134,6 +190,7 @@ impl FastqStats {
             }
 
             let phred = quality - b'!';
+            low += u64::from(phred < threshold);
 
             self.quality_sum += u64::from(phred);
 
@@ -145,6 +202,7 @@ impl FastqStats {
                 self.q30_bases += 1;
             }
         }
+        low
     }
 
     pub fn mean_length(&self) -> f64 {

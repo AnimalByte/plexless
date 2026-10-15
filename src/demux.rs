@@ -11,7 +11,8 @@ use crate::output::{
     OutputLayout, ResolvedOutputMode, available_memory_bytes, calculate_fastq_output_buffer_policy,
     report_output_mode, resolve_output_mode,
 };
-use crate::pass_through::{BiologicalBounds, PassThroughPlans, detect_pass_through};
+use crate::pass_through::{BiologicalBounds, PassThroughPlans};
+use crate::preprocessing::{PreprocessingMetrics, Preprocessor};
 use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
 use crate::stats::{FastqStats, MateQcStats};
@@ -25,6 +26,7 @@ const PAIRED_RESYNC_WINDOW: usize = 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct DemuxCounts {
+    pub(crate) preprocessing: PreprocessingMetrics,
     pub(crate) assigned: u64,
     pub(crate) unmatched: u64,
     pub(crate) ambiguous: u64,
@@ -39,6 +41,7 @@ pub(crate) struct DemuxCounts {
 
 impl DemuxCounts {
     pub(crate) fn merge(&mut self, other: &Self) {
+        self.preprocessing.merge(&other.preprocessing);
         self.assigned += other.assigned;
         self.unmatched += other.unmatched;
         self.ambiguous += other.ambiguous;
@@ -52,6 +55,30 @@ impl DemuxCounts {
         self.pass_through_bases += other.pass_through_bases;
     }
 
+    pub(crate) fn write_preprocessing_reports(
+        &self,
+        dir: &Path,
+        paired: bool,
+        qc: bool,
+    ) -> Result<(), String> {
+        let classified = self.assigned + self.unmatched + self.ambiguous + self.unrouted;
+        if self.preprocessing.processed != classified
+            || self.preprocessing.processed
+                != self.preprocessing.retained + self.preprocessing.rejected
+        {
+            return Err("Preprocessing fragment counts do not reconcile".into());
+        }
+        self.preprocessing.write(dir, paired, qc)
+    }
+
+    pub(crate) fn sync_adapter_counts(&mut self) {
+        self.pass_through = self.preprocessing.full;
+        self.pass_through_bases = self.preprocessing.full_bases.iter().sum();
+        self.no_pass_through = self.preprocessing.scanned
+            - self.preprocessing.full.iter().sum::<u64>()
+            - self.preprocessing.partial.iter().sum::<u64>();
+    }
+
     #[inline]
     pub(crate) fn biological_bounds(
         &mut self,
@@ -59,19 +86,15 @@ impl DemuxCounts {
         sample: u32,
         mate: usize,
         seq: &[u8],
+        qual: &[u8],
         start: usize,
     ) -> BiologicalBounds {
-        let mut end = seq.len();
-        if let Some(signature) = routing.pass_through.signature(sample, mate) {
-            if let Some(relative) = detect_pass_through(&seq[start..], signature) {
-                end = start + relative;
-                self.pass_through[mate] += 1;
-                self.pass_through_bases += (seq.len() - end) as u64;
-            } else {
-                self.no_pass_through += 1;
-            }
-        }
-        BiologicalBounds { start, end }
+        let bounds =
+            routing
+                .preprocessing
+                .bounds(sample, mate, seq, qual, start, &mut self.preprocessing);
+        self.sync_adapter_counts();
+        bounds
     }
 }
 
@@ -116,15 +139,16 @@ impl SerialWriter {
     }
 }
 
-pub fn run_with_threads(args: DemuxArgs, threads: usize) -> Result<(), String> {
+pub fn run_with_threads(mut args: DemuxArgs, threads: usize) -> Result<(), String> {
     if threads == 0 {
         return Err("Thread count must be greater than 0".into());
     }
 
+    crate::fastp_options::prepare(&mut args)?;
     let input = resolve_input_source(&args)?;
 
     if let InputSource::Fastq(inputs) = input {
-        if threads == 1 {
+        if threads == 1 && !args.preprocessing.fastp.needs_pipeline() {
             return run_resolved(args, inputs);
         }
         return crate::parallel::run(args, threads, InputSource::Fastq(inputs));
@@ -133,7 +157,12 @@ pub fn run_with_threads(args: DemuxArgs, threads: usize) -> Result<(), String> {
     crate::parallel::run(args, threads, input)
 }
 
-pub fn run(args: DemuxArgs) -> Result<(), String> {
+pub fn run(mut args: DemuxArgs) -> Result<(), String> {
+    crate::fastp_options::prepare(&mut args)?;
+    if args.preprocessing.fastp.needs_pipeline() {
+        let input = resolve_input_source(&args)?;
+        return crate::parallel::run(args, 1, input);
+    }
     let inputs = resolve_inputs(&args)?;
     run_resolved(args, inputs)
 }
@@ -152,7 +181,11 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
     let samples = SampleSheet::load(&args.samples, &layout, &catalog)?;
 
     let mut routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
-    routing.pass_through = PassThroughPlans::compile(&layout, &catalog, &samples, &args)?;
+    routing.preprocessing = Preprocessor::new(
+        PassThroughPlans::compile(&layout, &catalog, &samples, &args)?,
+        args.preprocessing.clone(),
+        args.fastq_stats,
+    )?;
 
     let output_dir = args.output.clone();
     let output_layout = OutputLayout::new(samples.samples.len(), paired, args.write_unassigned);
@@ -200,13 +233,28 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
     };
     let run_marker = OutputRunMarker::begin(&output_dir)?;
 
-    let (r1_qc, r2_qc) = MateQcStats::for_layout(&layout);
+    let (mut r1_qc, mut r2_qc) = MateQcStats::for_layout(&layout);
+    if args.preprocessing.fastp.json.is_some() || args.preprocessing.fastp.html.is_some() {
+        r1_qc.enable_detailed();
+        if let Some(qc) = r2_qc.as_mut() {
+            qc.enable_detailed();
+        }
+    }
+    if args.preprocessing.fastp.overrepresentation_analysis {
+        r1_qc.enable_overrepresentation(args.preprocessing.fastp.overrepresentation_sampling);
+        if let Some(qc) = r2_qc.as_mut() {
+            qc.enable_overrepresentation(args.preprocessing.fastp.overrepresentation_sampling);
+        }
+    }
     let mut r1_stats = args.fastq_stats.then_some(r1_qc);
     let mut r2_stats = if args.fastq_stats { r2_qc } else { None };
 
     let mut counts = DemuxCounts::default();
 
     match &inputs {
+        InputFiles::Interleaved(_) => {
+            return Err("Interleaved input requires the ordered processing pipeline".into());
+        }
         InputFiles::Single(reads) => {
             run_single(reads, &routing, &mut writer, r1_stats.as_mut(), &mut counts)?
         }
@@ -222,7 +270,9 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
     }
 
     let completion = writer.finish_with_qc()?;
-    completion.sample_qc.verify(counts.assigned)?;
+    completion
+        .sample_qc
+        .verify(counts.assigned - counts.preprocessing.assigned_rejected)?;
     verify_serial_unassigned_counts(
         &counts,
         paired,
@@ -239,6 +289,12 @@ fn run_resolved(args: DemuxArgs, inputs: InputFiles) -> Result<(), String> {
             .sample_qc
             .write_report(&output_dir, &samples, args.low_sample_fraction)?;
 
+    counts.write_preprocessing_reports(&output_dir, paired, args.fastq_stats)?;
+    crate::report::write(
+        &args.preprocessing.fastp,
+        [r1_stats.as_ref(), r2_stats.as_ref()],
+        &counts.preprocessing,
+    )?;
     run_marker.complete()?;
 
     print_summary(&counts);
@@ -276,6 +332,8 @@ fn verify_serial_unassigned_counts(
         .checked_add(counts.ambiguous)
         .and_then(|value| value.checked_add(counts.unrouted))
         .ok_or("Unassigned count overflow")?;
+    let classified =
+        classified - (counts.preprocessing.rejected - counts.preprocessing.assigned_rejected);
     let expected = if paired {
         classified
             .checked_mul(2)
@@ -334,11 +392,18 @@ fn run_single(
             RouteResult::Assigned { sample_id } => {
                 counts.assigned += 1;
 
-                let bounds = counts.biological_bounds(routing, sample_id, 0, seq, prefix_len);
+                let bounds = counts.biological_bounds(routing, sample_id, 0, seq, qual, prefix_len);
                 let trimmed_seq = &seq[bounds.range()];
 
                 let trimmed_qual = &qual[bounds.range()];
 
+                if !routing.preprocessing.retain(
+                    &[(seq, qual, bounds)],
+                    true,
+                    &mut counts.preprocessing,
+                )? {
+                    continue;
+                }
                 writer.write_sample(
                     sample_id,
                     OutputMate::Single,
@@ -351,19 +416,37 @@ fn run_single(
             RouteResult::Unmatched => {
                 counts.unmatched += 1;
 
-                writer.write_unassigned(OutputMate::Single, record.id(), seq, qual)?;
+                if routing.preprocessing.retain(
+                    &[(seq, qual, BiologicalBounds::full(seq.len()))],
+                    false,
+                    &mut counts.preprocessing,
+                )? {
+                    writer.write_unassigned(OutputMate::Single, record.id(), seq, qual)?;
+                }
             }
 
             RouteResult::Ambiguous => {
                 counts.ambiguous += 1;
 
-                writer.write_unassigned(OutputMate::Single, record.id(), seq, qual)?;
+                if routing.preprocessing.retain(
+                    &[(seq, qual, BiologicalBounds::full(seq.len()))],
+                    false,
+                    &mut counts.preprocessing,
+                )? {
+                    writer.write_unassigned(OutputMate::Single, record.id(), seq, qual)?;
+                }
             }
 
             RouteResult::Unrouted => {
                 counts.unrouted += 1;
 
-                writer.write_unassigned(OutputMate::Single, record.id(), seq, qual)?;
+                if routing.preprocessing.retain(
+                    &[(seq, qual, BiologicalBounds::full(seq.len()))],
+                    false,
+                    &mut counts.preprocessing,
+                )? {
+                    writer.write_unassigned(OutputMate::Single, record.id(), seq, qual)?;
+                }
             }
         }
     }
@@ -546,9 +629,22 @@ fn process_pair_parts(
         RouteResult::Assigned { sample_id } => {
             counts.assigned += 1;
 
-            let r1_bounds = counts.biological_bounds(routing, sample_id, 0, r1_seq, r1_prefix);
-            let r2_bounds = counts.biological_bounds(routing, sample_id, 1, r2_seq, r2_prefix);
+            let [r1_bounds, r2_bounds] = routing.preprocessing.pair_bounds(
+                sample_id,
+                [r1_seq, r2_seq],
+                [r1_qual, r2_qual],
+                [r1_prefix, r2_prefix],
+                &mut counts.preprocessing,
+            );
+            counts.sync_adapter_counts();
 
+            if !routing.preprocessing.retain(
+                &[(r1_seq, r1_qual, r1_bounds), (r2_seq, r2_qual, r2_bounds)],
+                true,
+                &mut counts.preprocessing,
+            )? {
+                return Ok(());
+            }
             writer.write_sample(
                 sample_id,
                 OutputMate::R1,
@@ -568,18 +664,48 @@ fn process_pair_parts(
 
         RouteResult::Unmatched => {
             counts.unmatched += 1;
+            if !routing.preprocessing.retain(
+                &[
+                    (r1_seq, r1_qual, BiologicalBounds::full(r1_seq.len())),
+                    (r2_seq, r2_qual, BiologicalBounds::full(r2_seq.len())),
+                ],
+                false,
+                &mut counts.preprocessing,
+            )? {
+                return Ok(());
+            }
             writer.write_unassigned(OutputMate::R1, r1_id, r1_seq, r1_qual)?;
             writer.write_unassigned(OutputMate::R2, r2_id, r2_seq, r2_qual)?;
         }
 
         RouteResult::Ambiguous => {
             counts.ambiguous += 1;
+            if !routing.preprocessing.retain(
+                &[
+                    (r1_seq, r1_qual, BiologicalBounds::full(r1_seq.len())),
+                    (r2_seq, r2_qual, BiologicalBounds::full(r2_seq.len())),
+                ],
+                false,
+                &mut counts.preprocessing,
+            )? {
+                return Ok(());
+            }
             writer.write_unassigned(OutputMate::R1, r1_id, r1_seq, r1_qual)?;
             writer.write_unassigned(OutputMate::R2, r2_id, r2_seq, r2_qual)?;
         }
 
         RouteResult::Unrouted => {
             counts.unrouted += 1;
+            if !routing.preprocessing.retain(
+                &[
+                    (r1_seq, r1_qual, BiologicalBounds::full(r1_seq.len())),
+                    (r2_seq, r2_qual, BiologicalBounds::full(r2_seq.len())),
+                ],
+                false,
+                &mut counts.preprocessing,
+            )? {
+                return Ok(());
+            }
             writer.write_unassigned(OutputMate::R1, r1_id, r1_seq, r1_qual)?;
             writer.write_unassigned(OutputMate::R2, r2_id, r2_seq, r2_qual)?;
         }
@@ -988,7 +1114,11 @@ fn write_barcode_stats_rows(
     Ok(())
 }
 
-fn write_stats_row(file: &mut File, mate: &str, stats: &FastqStats) -> Result<(), String> {
+pub(crate) fn write_stats_row(
+    file: &mut File,
+    mate: &str,
+    stats: &FastqStats,
+) -> Result<(), String> {
     writeln!(
         file,
         "{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.4}\t{:.4}\t{:.2}\t{:.4}\t{:.4}",
@@ -1018,6 +1148,16 @@ pub(crate) fn print_summary(counts: &DemuxCounts) {
     eprintln!("Demultiplexing complete");
     eprintln!("  total:      {total}");
     eprintln!("  assigned:   {}", counts.assigned);
+    eprintln!("  fragments retained: {}", counts.preprocessing.retained);
+    eprintln!("  fragments rejected: {}", counts.preprocessing.rejected);
+    eprintln!(
+        "  partial pass-through R1: {}",
+        counts.preprocessing.partial[0]
+    );
+    eprintln!(
+        "  partial pass-through R2: {}",
+        counts.preprocessing.partial[1]
+    );
     eprintln!("  unmatched:  {}", counts.unmatched);
     eprintln!("  ambiguous:  {}", counts.ambiguous);
     eprintln!("  unrouted:   {}", counts.unrouted);

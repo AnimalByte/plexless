@@ -34,6 +34,7 @@ fn args(
         output_chunk_size: ByteSizeSetting::Bytes(32 * 1024),
         output_buffer_memory: ByteSizeSetting::Bytes(4 * 1024 * 1024),
         max_open_files: Some(2),
+        preprocessing: Default::default(),
         no_pass_through: false,
         pass_through_mismatches: 1,
         r1_distal_structure: None,

@@ -57,6 +57,7 @@ fn paired_end_demux_combines_a_and_b_across_mates_and_trims_t_from_each_mate() {
         output_chunk_size: plexless::cli::ByteSizeSetting::Auto,
         output_buffer_memory: plexless::cli::ByteSizeSetting::Auto,
         max_open_files: None,
+        preprocessing: Default::default(),
         no_pass_through: false,
         pass_through_mismatches: 1,
         r1_distal_structure: None,

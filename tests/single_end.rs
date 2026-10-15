@@ -49,6 +49,7 @@ fn single_end_demux_decodes_a_and_b_and_trims_t() {
         output_chunk_size: plexless::cli::ByteSizeSetting::Auto,
         output_buffer_memory: plexless::cli::ByteSizeSetting::Auto,
         max_open_files: None,
+        preprocessing: Default::default(),
         no_pass_through: false,
         pass_through_mismatches: 1,
         r1_distal_structure: None,

@@ -14,6 +14,7 @@ fn run() -> Result<(), String> {
     let threads = cli.threads;
 
     match cli.command {
+        Command::Trim(args) => plexless::trim::run_with_threads(args, threads),
         Command::Demux(args) => {
             args.validate()?;
             plexless::demux::run_with_threads(args, threads)

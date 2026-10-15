@@ -91,7 +91,7 @@ fn se_default_symmetric_inference_and_disable_across_writers() {
                 if disabled {
                     command.arg("--no-pass-through");
                 }
-                let result = command.output().unwrap();
+                let result = command.arg("--no-overlap").output().unwrap();
                 assert!(
                     result.status.success(),
                     "{}",
@@ -188,6 +188,7 @@ fn pe_automatic_inference_repeated_pieces_rc_and_independent_mates() {
                 .arg(&samples)
                 .arg("--output")
                 .arg(&out)
+                .arg("--no-overlap")
                 .output()
                 .unwrap();
             assert!(
@@ -250,7 +251,7 @@ fn explicit_override_long_structure_orientation_and_sample_specificity() {
         if override_enabled {
             command.args(["--r1-distal-structure", "R1_20B2T12A(rc)12A"]);
         }
-        let result = command.output().unwrap();
+        let result = command.arg("--no-overlap").output().unwrap();
         assert!(
             result.status.success(),
             "{}",
@@ -301,6 +302,7 @@ fn unavailable_anchor_diagnostic_and_override_validation() {
             .arg(&samples)
             .arg("--output")
             .arg(&out)
+            .arg("--no-overlap")
             .output()
             .unwrap();
         assert_eq!(result.status.success(), index == 0);
@@ -343,6 +345,7 @@ fn corrected_assignment_uses_canonical_distal_and_unassigned_is_not_scanned() {
             .arg(&samples)
             .arg("--output")
             .arg(&out)
+            .arg("--no-overlap")
             .output()
             .unwrap();
         assert!(
@@ -420,6 +423,7 @@ fn pe_false_anchor_candidates_do_not_hide_later_distal_or_affect_other_mate() {
                 .arg(&samples)
                 .arg("--output")
                 .arg(&out)
+                .arg("--no-overlap")
                 .output()
                 .unwrap();
             assert!(

@@ -62,12 +62,14 @@ enum WriterKey {
     Sample { sample_id: u32, mate: OutputMate },
 
     Unassigned { mate: OutputMate },
+    Extra { target: OutputTarget },
 }
 
 impl WriterKey {
     fn mate(self) -> OutputMate {
         match self {
             Self::Sample { mate, .. } | Self::Unassigned { mate } => mate,
+            Self::Extra { .. } => OutputMate::Single,
         }
     }
 }
@@ -104,8 +106,10 @@ pub(crate) struct WriterCompletion {
 
 pub struct CompressedWriterManager {
     output_dir: PathBuf,
+    fastp: Box<crate::fastp_options::FastpOptions>,
     sample_names: Vec<String>,
-    cache: HashMap<WriterKey, CachedRawWriter>,
+    cache: HashMap<(WriterKey, u64), CachedRawWriter>,
+    opened_parts: HashMap<WriterKey, u64>,
     max_open_writers: usize,
     write_unassigned: bool,
     paired: bool,
@@ -329,6 +333,9 @@ impl WriterManager {
                 )
                 .ok_or("Compressed output size overflow")?;
             match job.key.target {
+                OutputTarget::Merged { .. } | OutputTarget::Auxiliary { .. } => {
+                    self.writer.append_extra_member(job.key.target, &member)?
+                }
                 OutputTarget::Sample { sample_id } => {
                     self.writer
                         .append_sample_member(sample_id, job.key.mate, &member)?;
@@ -521,8 +528,10 @@ impl CompressedWriterManager {
 
         Ok(Self {
             output_dir,
+            fastp: Default::default(),
             sample_names,
             cache: HashMap::new(),
+            opened_parts: HashMap::new(),
             max_open_writers,
             write_unassigned,
             paired,
@@ -530,6 +539,106 @@ impl CompressedWriterManager {
         })
     }
 
+    pub(crate) fn configure_fastp(
+        &mut self,
+        options: &crate::fastp_options::FastpOptions,
+    ) -> Result<(), String> {
+        if self.sample_names.len() != 1
+            && (options.out1.is_some() || options.out2.is_some() || options.merged_out.is_some())
+        {
+            return Err("Custom --out1/--out2/--merged-out paths require a single output sample; multisample demux uses per-sample filenames".into());
+        }
+        *self.fastp = options.clone();
+        let layout = OutputLayout::new(self.sample_names.len(), self.paired, self.write_unassigned)
+            .with_fastp(options);
+        let mut destinations = HashMap::new();
+        let mut reserved = HashSet::new();
+        for name in [
+            "preprocessing.tsv",
+            "retained_fastq_stats.tsv",
+            "fastq_stats.tsv",
+            "barcode_stats.tsv",
+            "sample_metrics.tsv",
+            INCOMPLETE_RUN_MARKER,
+        ] {
+            reserved.insert(crate::fastp_options::absolute_path(
+                &self.output_dir.join(name),
+            )?);
+        }
+        for path in [options.json.as_ref(), options.html.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let path = crate::fastp_options::absolute_path(path)?;
+            if !reserved.insert(path) {
+                return Err(
+                    "Report paths conflict with each other or a reserved report/marker".into(),
+                );
+            }
+        }
+        for index in 0..layout.stream_count()? {
+            let key = layout.key_at(index)?;
+            if matches!(
+                key.target,
+                OutputTarget::Auxiliary {
+                    stream: crate::output::AuxiliaryStream::Stdout
+                }
+            ) {
+                continue;
+            }
+            let path = crate::fastp_options::absolute_path(&configured_path(
+                &self.output_dir,
+                &self.sample_names,
+                key,
+                options,
+                0,
+            )?)?;
+            if reserved.contains(&path) {
+                return Err(format!(
+                    "FASTQ output conflicts with a report/marker: {}",
+                    path.display()
+                ));
+            }
+            let canonical = layout.canonical_target(key.target);
+            if destinations
+                .insert(path.clone(), (canonical, key.mate))
+                .is_some_and(|prior| prior != (canonical, key.mate))
+            {
+                return Err(format!("FASTQ output path collision: {}", path.display()));
+            }
+            if path.exists() {
+                return Err(format!("Refusing to overwrite output '{}'", path.display()));
+            }
+        }
+
+        for path in [
+            options.out1.as_deref(),
+            options.out2.as_deref(),
+            options.merged_out.as_deref(),
+            options.failed_out.as_deref(),
+            options.unpaired1.as_deref(),
+            options.unpaired2.as_deref(),
+            options.overlapped_out.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.exists() {
+                return Err(format!("Refusing to overwrite output '{}'", path.display()));
+            }
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn append_extra_member(
+        &mut self,
+        target: OutputTarget,
+        member: &[u8],
+    ) -> Result<(), String> {
+        self.append_member(WriterKey::Extra { target }, member)
+    }
     pub fn append_sample_member(
         &mut self,
         sample_id: u32,
@@ -567,6 +676,25 @@ impl CompressedWriterManager {
     }
 
     fn append_member(&mut self, key: WriterKey, member: &[u8]) -> Result<(), String> {
+        self.append_key_part(key, 0, member)
+    }
+    pub(crate) fn append_part(
+        &mut self,
+        key: OutputKey,
+        part: u64,
+        member: &[u8],
+    ) -> Result<(), String> {
+        let key = match key.target {
+            OutputTarget::Sample { sample_id } => WriterKey::Sample {
+                sample_id,
+                mate: key.mate,
+            },
+            OutputTarget::Unassigned => WriterKey::Unassigned { mate: key.mate },
+            target => WriterKey::Extra { target },
+        };
+        self.append_key_part(key, part, member)
+    }
+    fn append_key_part(&mut self, key: WriterKey, part: u64, member: &[u8]) -> Result<(), String> {
         if member.is_empty() {
             return Ok(());
         }
@@ -574,11 +702,14 @@ impl CompressedWriterManager {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
 
-        if !self.cache.contains_key(&key) {
-            self.open_writer(key)?;
+        if !self.cache.contains_key(&(key, part)) {
+            self.open_writer(key, part)?;
         }
 
-        let cached = self.cache.get_mut(&key).ok_or("Writer cache failure")?;
+        let cached = self
+            .cache
+            .get_mut(&(key, part))
+            .ok_or("Writer cache failure")?;
         cached.last_used = tick;
         cached
             .writer
@@ -586,21 +717,59 @@ impl CompressedWriterManager {
             .map_err(|e| format!("Could not append compressed FASTQ member: {e}"))
     }
 
-    fn open_writer(&mut self, key: WriterKey) -> Result<(), String> {
+    fn open_writer(&mut self, key: WriterKey, part: u64) -> Result<(), String> {
         if self.cache.len() >= self.max_open_writers {
             self.evict_oldest()?;
         }
 
-        let path = output_path(&self.output_dir, &self.sample_names, key)?;
-
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let output_key = match key {
+            WriterKey::Sample { sample_id, mate } => OutputKey {
+                target: OutputTarget::Sample { sample_id },
+                mate,
+            },
+            WriterKey::Unassigned { mate } => OutputKey {
+                target: OutputTarget::Unassigned,
+                mate,
+            },
+            WriterKey::Extra { target } => OutputKey {
+                target,
+                mate: OutputMate::Single,
+            },
+        };
+        let path = configured_path(
+            &self.output_dir,
+            &self.sample_names,
+            output_key,
+            &self.fastp,
+            part,
+        )?;
+        let stdout = matches!(
+            key,
+            WriterKey::Extra {
+                target: OutputTarget::Auxiliary {
+                    stream: crate::output::AuxiliaryStream::Stdout
+                }
+            }
+        );
+        let reopen = self
+            .opened_parts
+            .get(&key)
+            .is_some_and(|&opened| opened >= part);
+        let mut options = OpenOptions::new();
+        options.append(true);
+        if !stdout && !reopen {
+            options.create_new(true);
+        }
+        let file = options
             .open(&path)
             .map_err(|e| format!("Could not open output '{}': {e}", path.display()))?;
+        self.opened_parts
+            .entry(key)
+            .and_modify(|previous| *previous = (*previous).max(part))
+            .or_insert(part);
 
         self.cache.insert(
-            key,
+            (key, part),
             CachedRawWriter {
                 writer: BufWriter::new(file),
                 last_used: self.tick,
@@ -625,6 +794,89 @@ impl CompressedWriterManager {
 
         finish_raw_writer(cached.writer)
     }
+}
+
+pub(crate) fn configured_path(
+    output_dir: &Path,
+    sample_names: &[String],
+    key: OutputKey,
+    fastp: &crate::fastp_options::FastpOptions,
+    part: u64,
+) -> Result<PathBuf, String> {
+    let key = match key.target {
+        OutputTarget::Sample { sample_id } => WriterKey::Sample {
+            sample_id,
+            mate: key.mate,
+        },
+        OutputTarget::Unassigned => WriterKey::Unassigned { mate: key.mate },
+        target => WriterKey::Extra { target },
+    };
+    let path = match key {
+        WriterKey::Extra {
+            target: OutputTarget::Merged { sample_id },
+        } => {
+            if sample_names.len() == 1 {
+                fastp.merged_out.clone().unwrap_or_else(|| {
+                    output_dir.join(format!(
+                        "{}_merged.fastq.gz",
+                        sample_names[sample_id as usize]
+                    ))
+                })
+            } else {
+                output_dir.join(format!(
+                    "{}_merged.fastq.gz",
+                    sample_names[sample_id as usize]
+                ))
+            }
+        }
+        WriterKey::Extra {
+            target: OutputTarget::Auxiliary { stream },
+        } => {
+            use crate::output::AuxiliaryStream::*;
+            match stream {
+                Failed => fastp.failed_out.clone(),
+                Unpaired1 => fastp.unpaired1.clone(),
+                Unpaired2 => fastp.unpaired2.clone(),
+                Overlap => fastp.overlapped_out.clone(),
+                Stdout => Some("/dev/stdout".into()),
+            }
+            .ok_or("Missing auxiliary output path")?
+        }
+        WriterKey::Sample { mate, .. }
+            if sample_names.len() == 1 && (fastp.out1.is_some() || fastp.out2.is_some()) =>
+        {
+            if mate == OutputMate::R2 {
+                fastp.out2.clone()
+            } else {
+                fastp.out1.clone()
+            }
+            .map_or_else(|| output_path(output_dir, sample_names, key), Ok)?
+        }
+        _ => output_path(output_dir, sample_names, key)?,
+    };
+
+    let path = if fastp.split_records > 0
+        && !matches!(
+            key,
+            WriterKey::Extra {
+                target: OutputTarget::Auxiliary {
+                    stream: crate::output::AuxiliaryStream::Stdout
+                }
+            }
+        ) {
+        let filename = path
+            .file_name()
+            .ok_or("Missing split output filename")?
+            .to_string_lossy();
+        path.with_file_name(format!(
+            "{:0width$}.{filename}",
+            part + 1,
+            width = usize::from(fastp.split_prefix_digits)
+        ))
+    } else {
+        path
+    };
+    Ok(path)
 }
 
 pub(crate) fn build_sample_names(
@@ -688,6 +940,9 @@ fn output_path(
     key: WriterKey,
 ) -> Result<PathBuf, String> {
     let (name, mate) = match key {
+        WriterKey::Extra { .. } => {
+            return Err("Extra outputs require a configured FASTQ writer".into());
+        }
         WriterKey::Sample { sample_id, mate } => {
             let index = usize::try_from(sample_id).map_err(|_| "Invalid sample ID")?;
             let name = sample_names.get(index).ok_or("Unknown sample ID")?;

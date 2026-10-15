@@ -17,3 +17,23 @@ pub mod stats;
 pub mod structure;
 pub(crate) mod thread_plan;
 pub mod writer;
+
+pub(crate) mod preprocessing;
+pub(crate) mod technical;
+pub mod trim;
+
+pub(crate) mod overlap;
+
+pub mod fastp_options;
+pub(crate) mod quality_trim;
+
+pub(crate) mod fastp_runtime;
+
+pub(crate) mod read_ops;
+
+pub(crate) mod adapter_detection;
+
+pub(crate) mod distribution;
+pub(crate) mod report;
+
+pub(crate) mod overrepresentation;

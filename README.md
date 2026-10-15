@@ -1,684 +1,181 @@
-# plexless
+# Plexless
 
-`plexless` is a high-throughput hierarchical FASTQ and unmapped-CRAM
-demultiplexer for single-end and paired-end sequencing data. Read structures describe physical
-barcode pieces, while an ordinary tabular sample sheet defines parent-to-child
-barcode namespaces and sample routes.
+Demultiplex sequencing reads into samples, or trim and filter already-demultiplexed
+FASTQ. Plexless supports single-end and paired-end FASTQ, hierarchical barcode
+routing, and unmapped CRAM demultiplexing.
 
-Plexless resolves one routing level at a time. After barcode A resolves, B is
-matched only against B barcodes reachable beneath that A; C is then matched
-only beneath the resolved A/B path, and so on. Unrelated child namespaces never
-participate in matching or mismatch-safety validation.
+| Your input | Use | Required configuration |
+| --- | --- | --- |
+| Reads containing sample barcodes | `plexless demux` | Read layout, barcode TSV, sample TSV |
+| FASTQ already assigned to a sample | `plexless trim` | Input and output paths; adapter sequence for SE adapter trimming |
 
-Plexless is under active development. Validate demultiplexing results against
-an established workflow before using it in production or clinical pipelines.
+## Quick start
 
-## Highlights
-
-- True hierarchical routing compiled once at startup
-- Plain or gzip-compressed FASTQ input
-- Single-end and paired-end demultiplexing
-- Generic barcode symbols `A-Z`, with `T` reserved for technical sequence
-- Repeated barcode pieces within and across mates
-- Per-segment forward or reverse-complement orientation
-- Parent-local exact matching and correction by 0, 1, or 2 mismatches
-- Parent-local handling of observed `N` bases
-- Child sequence reuse across independent parent namespaces
-- Structured-prefix trimming for assigned reads
-- Default-on sample-specific distal pass-through trimming, independently per mate
-- Optional unassigned output and separate biological/barcode FASTQ statistics
-- Paired-read ID validation, bounded resynchronization, and orphan handling
-- Bounded multithreaded parsing, demultiplexing, compression, and ordered output
-- Unmapped CRAM input with FASTQ or metadata-preserving unmapped CRAM output
-
-## Performance
-
-Plexless is designed to scale with highly multiplexed sequencing runs. In
-`--output-mode auto`, it uses the low-coordination direct path below 384
-expected FASTQ output streams and the batch-owned buffered pipeline at 384
-streams or more.
-
-The table below reports median wall time from three repetitions of a synthetic
-10-million-fragment demultiplexing benchmark on an Intel Core i7-13700K desktop
-with 24 logical CPUs and DDR5 memory. Single-end (SE) runs contain 10 million
-reads; paired-end (PE) runs contain 10 million read pairs. Both tools used gzip
-compression level 2. Plexless used the portable release build
-(`cargo build --release`), without `-C target-cpu=native`, and was compared
-against fqtk 0.4.0.
-
-These historical measurements predate default-on distal pass-through scanning.
-See the [v0.6.0 benchmark report](docs/pass-through-validation.md) for the current
-baseline/disabled/enabled comparison; do not assume the historical rates include
-the new scan.
-
-| Mode | Samples | Plexless | fqtk | Plexless speed vs fqtk |
-| --- | ---: | ---: | ---: | ---: |
-| SE | 384 | 3.01 s | 6.43 s | 2.14x |
-| SE | 700 | 3.06 s | 6.29 s | 2.06x |
-| SE | 1,500 | 3.34 s | 6.44 s | 1.93x |
-| PE | 384 | 6.16 s | 6.55 s | 1.06x |
-| PE | 700 | 6.55 s | 6.63 s | 1.01x |
-| PE | 1,500 | 6.92 s | 7.11 s | 1.03x |
-
-These results are workload- and hardware-specific. fqtk was faster in this
-benchmark at lower fan-out and at lower thread counts. Plexless's strongest
-scaling appeared in the high-multiplexing buffered path as additional CPU
-parallelism became available.
-
-For the 1,500-sample fqtk comparisons, the process open-file soft limit was
-raised from 1,024 to 8,192 after fqtk exhausted the default limit. Plexless
-FASTQ output uses a bounded writer cache, so FASTQ descriptor use is capped
-instead of requiring every output file to remain open simultaneously.
-
-## Installation
-
-Plexless uses flate2 with the pure-Rust zlib-rs backend for FASTQ gzip output.
-Source builds also compile HTSlib for CRAM support and require a C toolchain,
-`make`, `pkg-config`, Clang, libclang, and system zlib in addition to a recent
-stable Rust toolchain and Cargo:
+### 1. Demultiplex reads into samples
 
 ```bash
-# Ubuntu/Debian
-sudo apt install build-essential clang libclang-dev make pkg-config zlib1g-dev
-
-# Fedora/RHEL
-sudo dnf install clang clang-devel gcc make pkgconf-pkg-config zlib-devel
-
-# Arch Linux
-sudo pacman -S base-devel clang pkgconf zlib
-```
-
-### Install from crates.io
-
-Install Plexless and verify the CLI:
-
-```bash
-cargo install plexless
-plexless --help
-```
-
-`cargo install plexless` installs only the `plexless` executable into Cargo's
-binary directory, normally `$HOME/.cargo/bin`.
-
-### Download a prebuilt binary
-
-Linux x86-64 archives are available from the public
-[GitHub releases page](https://github.com/AnimalByte/plexless/releases). After
-downloading the archive for the desired version:
-
-```bash
-tar -xzf plexless-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-mkdir -p "$HOME/.local/bin"
-install -m 0755 \
-  plexless-vX.Y.Z-x86_64-unknown-linux-gnu/plexless \
-  "$HOME/.local/bin/plexless"
-plexless --help
-```
-
-Prebuilt Linux binaries require the zlib runtime library (`zlib1g` on
-Ubuntu/Debian and `zlib` on Fedora/Arch).
-
-### Build from source
-
-Clone the public repository and build an optimized binary:
-
-```bash
-git clone https://github.com/AnimalByte/plexless.git
-cd plexless
-cargo build --release
-```
-
-The resulting executable is `target/release/plexless`. Alternatively, install
-the current checkout through Cargo:
-
-```bash
-cargo install --path .
-```
-
-## Command-line reference
-
-Plexless has one subcommand, `demux`:
-
-```text
-plexless [--threads <N>] demux [OPTIONS] \
-  --barcodes <TSV> --samples <TSV> --output <DIR> \
-  <--reads <FASTQ> | --r1 <FASTQ> --r2 <FASTQ> | --cram <CRAM>>
-```
-
-`--threads` is global and may also appear after `demux`. Show the authoritative
-help for the installed version with:
-
-```bash
-plexless --help
-plexless demux --help
-```
-
-### Global options
-
-| Flag | Default | Description |
-| --- | ---: | --- |
-| `--threads <N>` | `1` | Global work budget shared by input decoding, routing, and output. FASTQ `1` uses the serial reference; CRAM uses no HTSlib background workers at `1`. Values must be positive integers. |
-| `-h`, `--help` | — | Print help and exit. |
-
-### Input and routing options
-
-| Flag | Required | Description |
-| --- | :---: | --- |
-| `--reads <FASTQ>` | SE | Single-end FASTQ or FASTQ.gz input. Conflicts with `--r1` and `--r2`. |
-| `--r1 <FASTQ>` | PE | Paired-end R1 FASTQ or FASTQ.gz input. Requires `--r2`. |
-| `--r2 <FASTQ>` | PE | Paired-end R2 FASTQ or FASTQ.gz input. Requires `--r1`. |
-| `--cram <CRAM>` | CRAM | One unmapped CRAM input. Conflicts with all FASTQ inputs. |
-| `--read-mode <single\|paired>` | CRAM | Required declaration of CRAM record interpretation; never inferred. |
-| `--output-format <fastq\|cram>` | CRAM | Required output choice. Existing FASTQ input needs no new option and remains FASTQ output. |
-| `--structure <LAYOUT>` | SE | Single-end read structure, such as `R1_10A11B4T`. |
-| `--r1-structure <LAYOUT>` | PE¹ | R1 read structure, such as `R1_10A11B4T`. |
-| `--r2-structure <LAYOUT>` | PE¹ | R2 read structure, such as `R2_8C`. |
-| `--barcodes <TSV>` | Always | Barcode whitelist with `Set`, `ID`, and `Sequence` columns. |
-| `--samples <TSV>` | Always | Routing table with `Sample` first, followed by barcode-set columns. |
-| `--max-mismatches <0-2>` | No (`1`) | Maximum substitutions allowed at each routing node. Observed `N` positions consume this budget. |
-| `--no-pass-through` | No | Disable default-on distal read-through detection; retain proximal-only trimming. |
-| `--pass-through-mismatches <0-2>` | No (`1`) | Distal substitution budget, independent of barcode correction. The anchor must remain exact. |
-| `--r1-distal-structure <LAYOUT>` | No | Override inferred R1 distal geometry in observed orientation. |
-| `--r2-distal-structure <LAYOUT>` | No | Override inferred R2 distal geometry in observed orientation (PE only). |
-
-¹ Paired input requires one or both mate structures. A mate without a structure
-is retained as biological sequence but supplies no barcode pieces.
-
-Exactly one input mode is allowed. Single-end runs require `--reads` and
-`--structure`. Paired-end runs require `--r1`, `--r2`, and at least one of
-`--r1-structure` or `--r2-structure`.
-
-CRAM input requires both `--read-mode` and `--output-format`. Only raw,
-unmapped CRAM is accepted. Paired CRAM must declare queryname ordering/grouping
-in `@HD` with `SO:queryname` or `GO:query`. See the complete
-[CRAM contract](docs/cram.md), including validation and metadata policy.
-
-### Output and performance options
-
-| Flag | Default | Description |
-| --- | ---: | --- |
-| `-o`, `--output <DIR>` | Required | Output directory. Plexless creates it if absent; an existing directory must be empty. |
-| `--compression-level <0-9>` | `2` | Compression level for output FASTQ gzip streams or CRAM files. Lower levels generally favor throughput. |
-| `--output-mode <MODE>` | `auto` | `auto`, `direct`, or `buffered`. Auto selects direct below 384 expected streams and buffered at 384 or more. |
-| `--output-chunk-size <SIZE>` | `auto` | Buffered-mode target for uncompressed bytes per gzip member. For FASTQ input, auto uses the qualified 32 KiB target. Explicit values must be 32 KiB–64 MiB and no larger than the buffer budget. |
-| `--output-buffer-memory <SIZE>` | `auto` | Buffered-mode memory budget for active output accumulators. Explicit values must be at least 1 MiB and no more than half of currently available memory. |
-| `--max-open-files <N>` | adaptive | FASTQ: positive override for the bounded writer cache. CRAM: must be at least the simultaneous destination count; CRAM writers cannot be reopened for append. |
-
-`SIZE` is a positive integer followed optionally by `B`, `K`/`KB`/`KiB`,
-`M`/`MB`/`MiB`, or `G`/`GB`/`GiB`; suffixes are case-insensitive and use
-binary multiples. Examples: `262144`, `256K`, `512MiB`, and `2G`. Decimal
-quantities such as `1.5G` are not accepted. `auto` is valid for both size
-options.
-
-The defaults are recommended. Buffer-size overrides affect only buffered mode.
-Expected streams count sample/mate files, plus enabled unassigned files: 16 SE
-samples produce 16 streams, while 16 PE samples produce 32. See
-[Parallelism and compression](#parallelism-and-compression) for memory sizing,
-ordering, and file-cache details.
-
-### QC and unassigned-read options
-
-| Flag | Default | Description |
-| --- | ---: | --- |
-| `--fastq-stats` | Off | Write biological-read statistics to `fastq_stats.tsv` and physical barcode-region statistics to `barcode_stats.tsv`. |
-| `--write-unassigned` | Off | Write unmatched, ambiguous, unrouted, and orphan reads untrimmed to `unassigned*.fastq.gz`. |
-| `--low-sample-fraction <0-1>` | `0.05` | Mark a populated sample `LOW_REPRESENTATION` below this fraction of the nonzero sample median. `0` disables low-representation classifications; missing-sample warnings remain mandatory. |
-| `-h`, `--help` | — | Print `demux` help and exit. |
-
-Every successful run writes `sample_metrics.tsv`; `--fastq-stats` adds the
-biological and barcode reports. Output filenames and report fields are described in
-[Output behavior](#output-behavior).
-
-### Single-end example
-
-```bash
-plexless --threads 8 demux \
-  --reads reads.fastq.gz \
-  --structure R1_10A11B4T \
-  --barcodes barcodes.tsv \
-  --samples samples.tsv \
-  --output demux_out \
-  --max-mismatches 1 \
-  --compression-level 2 \
-  --write-unassigned
-```
-
-### Paired-end example with orientation normalization
-
-```bash
-plexless --threads 16 demux \
-  --r1 reads_R1.fastq.gz \
-  --r2 reads_R2.fastq.gz \
-  --r1-structure R1_10A11B4T \
-  --r2-structure 'R2_10A(rc)11B(rc)' \
-  --barcodes barcodes.tsv \
-  --samples samples.tsv \
-  --output demux_out \
-  --fastq-stats
-```
-
-Quote structures containing `(rc)` so shells do not interpret the
-parentheses.
-
-### Unmapped CRAM examples
-
-Single-end CRAM to FASTQ requires an explicit lossy format choice:
-
-```bash
-plexless --threads 8 demux \
-  --cram reads.cram --read-mode single --output-format fastq \
-  --structure R1_10A11B4T \
+plexless demux --reads reads.fq.gz --structure R1_10A11B4T \
   --barcodes barcodes.tsv --samples samples.tsv \
-  --output demux_fastq --write-unassigned
+  --output demux --threads 8
 ```
 
-Plexless reports that SAM/CRAM metadata not representable in FASTQ will not be
-present in this output. It does not encode arbitrary tags in FASTQ headers.
+`R1_10A11B4T` means **10 barcode-A bases, 11 barcode-B bases, 4 technical bases,
+then biological sequence**. Adapt the layout to your library. Plexless assigns the
+sample from the original barcode regions, removes that prefix, and checks for
+adapter read-through. Filtering is off unless requested.
 
-Paired, queryname-grouped CRAM to metadata-preserving CRAM:
+Outputs: `demux/<sample>.fastq.gz`, `sample_metrics.tsv`, and `preprocessing.tsv`.
+For paired input, use `--r1`, `--r2`, and mate-specific structures; see the
+[paired demux example](docs/reference.md#paired-end-example-with-orientation-normalization).
+
+### 2. Clean paired-end FASTQ with filtering and reports
 
 ```bash
-plexless --threads 16 demux \
-  --cram paired.queryname.cram --read-mode paired --output-format cram \
-  --r1-structure R1_10A11B4T \
-  --r2-structure 'R2_10A(rc)11B(rc)' \
-  --barcodes barcodes.tsv --samples samples.tsv \
-  --output demux_cram --write-unassigned
+plexless trim --r1 R1.fq.gz --r2 R2.fq.gz \
+  --fastp-defaults --output cleaned --threads 8
 ```
 
-FASTQ to CRAM and aligned CRAM input/output are not supported.
+Plexless uses a unique, informative mate overlap to identify read-through.
+`--fastp-defaults` adds quality/N/length filters, duplicate estimation, and reports.
+It also enables automatic polyG trimming for recognized instrument IDs in files.
 
-### Explicit output tuning
+Outputs: `cleaned/trimmed_R1.fastq.gz`, `trimmed_R2.fastq.gz`, QC tables,
+`plexless.json`, and **`plexless.html`**. Open the HTML file to inspect the results.
+If either mate fails a filter, the primary output rejects the pair.
 
-Auto mode needs no tuning. To force the low-coordination path for a small run:
+Omit `--fastp-defaults` for adapter cleanup without the profile's filters or reports.
+Add `--fastq-stats` for QC tables without enabling filtering.
+
+### 3. Trim an already-demultiplexed T7 FASTQ
+
+Put your library's complete distal adapter sequence in `r1_distal.txt`, in the
+orientation it appears at the read's 3-prime end. Use only A/C/G/T bases.
 
 ```bash
-plexless --threads 8 demux [INPUT AND ROUTING OPTIONS] \
-  --output demux_out --output-mode direct
+R1_DISTAL=$(tr -d '\r\n' < r1_distal.txt)
+plexless trim --reads t7.fq.gz --r1-distal-sequence "$R1_DISTAL" \
+  --partial-pass-through --fastq-stats --output t7-trimmed --threads 8
 ```
 
-To force buffered output with explicit advanced limits:
+This keeps the read's 5-prime bases and removes supported distal adapter matches.
+Partial matching requires at least **20 informative known adapter bases** by
+default. No manufacturer adapter sequences are built in.
 
-```bash
-plexless --threads 16 demux [INPUT AND ROUTING OPTIONS] \
-  --output demux_out \
-  --output-mode buffered \
-  --output-chunk-size 32KiB \
-  --output-buffer-memory 512MiB \
-  --max-open-files 128
-```
+A **structure describes the beginning of a read**. A **distal sequence describes
+its 3-prime adapter**. Supply `--structure` in trim mode only when you intend to
+remove a prefix. Barcode and sample files are unnecessary for trim.
 
-`[INPUT AND ROUTING OPTIONS]` is illustrative shell notation, not literal
-syntax; supply one of the complete input forms shown above.
+## Defaults and optional features
 
-## Input configuration
+| Behavior | Ordinary run | With `--fastp-defaults` |
+| --- | --- | --- |
+| Paired overlap adapter detection | On | On |
+| Proximal clipping in trim | Only with an explicit structure | Same |
+| Quality/N/length filters | Off | Q15; at most 40% low-quality bases; at most 5 Ns; minimum length 15 |
+| Automatic adapter discovery | Off | On for SE; PE requires `--detect-adapter-for-pe` |
+| Automatic polyG trimming | Off | Instrument-based detection for file input |
+| Duplicate estimation | Off | On |
+| JSON/HTML reports | Only when requested | On, in the output directory |
+| Quality-window clipping, merging, correction, UMI extraction, duplicate removal | Only when requested | Same |
 
-### Read structures
+`--fastp-defaults` enables the profile settings listed above. Other transformations
+require their own flags. Explicit filter thresholds override the profile defaults.
 
-A read structure describes the structured prefix as repeated `<length><symbol>`
-segments. For example:
+Full sequence adapter matching is enabled when a usable signature is configured
+or inferred from the demux layout. Sequence-based partial matching requires
+`--partial-pass-through`; successful startup adapter discovery also enables it for
+that run. Paired overlap can identify a boundary independently of sequence-based
+partial matching. `--no-overlap` selects sequence-only adapter detection.
+See [adapter matching and orientation](docs/preprocessing.md) for the evidence
+rules and [all feature defaults](docs/fastp-compatibility.md) for advanced controls.
 
-```text
-R1_10A11B4T
-```
+## Common additions
 
-means 10 bases of barcode A, 11 bases of barcode B, and 4 technical bases.
-The remaining sequence is biological insert. The entire declared prefix is
-removed from assigned output.
+Append only the options you need; both commands share these controls.
 
-| Symbol | Meaning |
+| Goal | Add |
 | --- | --- |
-| `A-S`, `U-Z` | Generic logical barcode/routing levels. |
-| `T` | Technical sequence that is trimmed but not decoded. |
+| QC tables without filtering | `--fastq-stats` |
+| Standalone reports | `--json report.json --html report.html` |
+| Keep reads at least 30 bases long | `--min-length 30` |
+| Reject reads with more than 5 Ns | `--max-n 5` |
+| Cut a low-quality tail using a quality window | `--cut-tail` |
+| Trim partial adapters with more evidence | `--partial-pass-through --min-partial-adapter-overlap 30` |
+| Supply known technical T bases | `--technical-sequences technical.tsv` |
+| Merge uniquely overlapping pairs | `--merge` |
+| Extract an 8-base UMI from each read | `--umi --umi-loc per-read --umi-len 8` |
+| Remove exact duplicate original fragments | `--dedup` |
 
-Append `(rc)` to normalize only that barcode segment by reverse complement:
+Quality clipping changes the retained sequence. Quality filtering accepts or
+rejects the resulting read/pair. Merging, UMI extraction, and duplicate removal
+are separate optional steps; their [ordering and behavior](docs/fastp-compatibility.md#workflow-and-pairing)
+are documented in the feature guide.
 
-```text
-R1_10A11B
-R2_10A(rc)11B(rc)
-```
+## Demux configuration files
 
-Without `(rc)`, orientation is forward. Entire reads and quality strings are
-never reverse-complemented. Whitelist sequences are always canonical.
+The quick-start layout above uses these example files. They are tab-separated;
+replace the synthetic sequences and sample routes with your library's values.
 
-Repeated occurrences of a symbol form one logical barcode. Pieces are
-concatenated in this order:
-
-1. All matching R1 pieces in R1 structure order.
-2. All matching R2 pieces in R2 structure order.
-
-For example, with `R1_2A2B` and `R2_2A2B`, R1 A sequence `AC`, and normalized
-R2 A sequence `GT`, logical A is `ACGT`. Asymmetric structures such as
-`R1_10A11B` plus `R2_10A(rc)` are supported.
-
-### Distal pass-through trimming
-
-Pass-through detection is enabled by default without configuration changes.
-After sample assignment, Plexless searches for that sample's expected opposite
-end and removes the complete distal structure and everything following it.
-This is structure-aware contamination removal, not generic adapter discovery or
-Phred/low-quality trimming. Assignment and correction categories are unchanged.
-
-For paired reads, R1 expects the opposite orientation of the physical R2 prefix,
-and R2 expects the opposite orientation of R1. For single-end reads, the default
-assumes **symmetric ends**: R1 expects the opposite orientation of its own prefix.
-Use an override for asymmetric SE geometry or disable detection when that
-assumption does not apply. Each PE mate is trimmed independently; lengths may
-differ and pairs are neither merged nor synchronized by overlap.
-
-Compilation uses the assigned canonical whitelist sequence and existing logical
-extraction plans, including repeated pieces across mates. It reverses physical
-segment order and inverts each piece's orientation. `T` remains unknown technical
-sequence: its length and reversed position are retained, but its bases are
-excluded from verification. No additional barcode database is used.
-
-A 12–16-base exact anchor is chosen from contiguous known assigned bases,
-preferring longer anchors and then greater dinucleotide diversity. Anchors must
-contain at least three different bases, six different dinucleotides, and no base
-over 75%. Ends without a qualifying anchor are reported as unavailable at
-startup; Plexless never falls back to short or low-complexity anchors. An absent
-opposite mate prefix can likewise make one PE end unavailable.
-
-A rolling 2-bit scan runs only on assigned biological suffixes. Full packed
-Hamming verification runs only at exact anchor hits, across **all** known distal
-positions using 32-base chunks. `--pass-through-mismatches` defaults to one
-substitution, independently of `--max-mismatches`; anchor substitutions are not
-tolerated. There is no indel tolerance. Observed N or malformed bases reset the
-anchor window and reject verification at known positions. Only expected `T`
-positions are masked. Failed candidates do not stop the scan.
-
-The trim point is the beginning of the whole distal structure, including
-technical bases before the anchor. Sequence and quality use identical final
-coordinates. Complete structure coverage is required: truncated distal
-structures remain untrimmed. Biological sequence indistinguishable from the
-complete expected structure can still trigger detection; inference is an
-assumption, not proof of molecule geometry.
-
-Generic optional overrides reuse the existing structure grammar:
-
-```bash
-# Observed distal order: complete logical B, 3 unknown bases, reverse-complement A
-plexless demux ... --r1-distal-structure 'R1_20B3T24A(rc)'
-# Restore proximal-only behavior, bypassing compilation and scanning entirely
-plexless demux ... --no-pass-through
-```
-
-Overrides describe the distal sequence **as encountered**, with no automatic
-whole-structure reversal. Each referenced symbol must already exist in the
-proximal layout and be consumed completely; repeated occurrences split that
-symbol's canonical logical sequence in occurrence order, with `(rc)` applied
-per piece. Symbols may be omitted or reordered. This changes no whitelist or
-sample-sheet format. R1/R2 overrides replace only their respective inference.
-
-The completion summary adds detected R1/SE and R2 counts, scanned mates with no
-detection, and distal bases removed (including trailing sequence). Disabled or
-unavailable ends are not counted as scanned negatives. Existing structured QC
-formats are unchanged; output sample base counts reflect final trimmed reads.
-
-See the [v0.6.0 validation and performance report](docs/pass-through-validation.md)
-for tests, reproducible benchmark results, and the measured default scanning cost.
-
-### Barcode whitelist
-
-The barcode file is tab-separated with this exact header:
+`barcodes.tsv`:
 
 ```tsv
 Set	ID	Sequence
-A	A01	ACGT
-A	A02	TGCA
-B	B01	GATC
-B	B02	CTAG
+A	A01	ACGTTGCACT
+A	A02	TGCAAGGTCA
+B	B01	GATCCGTAGTC
+B	B02	CTAGGACTTGA
 ```
 
-Whitelist sequences must contain only `A`, `C`, `G`, and `T`. IDs must be
-unique within each set, all sequences in a set must have one length, and that
-length must equal the logical length from the read structure.
-
-Root sequences must be unique. A child sequence may be reused under
-independent parent paths, including with different IDs. Reuse is rejected only
-when both sequences become candidates in the same routing node.
-
-### Sample sheet
-
-The sample sheet remains a simple tab-separated table:
+`samples.tsv`:
 
 ```tsv
-Sample	A	B	C
-sample_1	A01	B01	C01
-sample_2	A01	B01	C02
-sample_3	A01	B02	C01
-sample_4	A02	B01	C03
+Sample	A	B
+sample_1	A01	B01
+sample_2	A01	B02
+sample_3	A02	B01
 ```
 
-The first column must be `Sample`. Remaining columns are the read-structure
-barcode symbols in alphabetical order, skipping reserved `T`. Every row must
-specify every level and every barcode ID must exist in the whitelist.
+Each barcode set's sequence length must match its logical length in the layout.
+Correction defaults to one mismatch and rejects unsafe or ambiguous assignments.
+A resolves first, then B is matched within that A's sample routes.
+[Layouts, orientation, and routing details](docs/reference.md#input-configuration).
 
-The columns define routing order. The table above compiles to:
+## Install and get help
 
-```text
-A decoder
-  -> resolved A child
-     -> parent-specific B decoder
-        -> resolved A/B child
-           -> parent-specific C decoder
-              -> sample
-```
-
-## Hierarchical matching and routing
-
-At runtime Plexless:
-
-1. Executes the compiled extraction plan for the root symbol.
-2. Encodes the logical barcode using the packed 2-bit representation.
-3. Decodes against that node's exact/correction index.
-4. Uses the decoder-local integer to select a child node or sample.
-5. Lazily repeats only if another routing level is reached.
-
-No barcode from an unrelated parent namespace is scanned. Correction safety is
-also node-local: mismatch tolerance `e` requires sibling Hamming distance
-`2e + 1`, but imposes no distance requirement across independent parents.
-
-Observed `N` bases consume mismatch budget rather than acting as free
-wildcards. N-aware matching scans only the current node's candidates.
-
-| Outcome | Meaning |
-| --- | --- |
-| Assigned | Every level resolves through the hierarchy to a sample. |
-| Unmatched | A barcode cannot resolve against candidates below its resolved parent. |
-| Ambiguous | The current node does not have one deterministic match. |
-| Unrouted | A valid root barcode has no compiled sample route. |
-
-Plexless never silently selects the first ambiguous candidate. Cross-level
-candidate-path rescue is not currently performed.
-
-## Output behavior
-
-Assigned single-end reads are written as `<sample>.fastq.gz`. Paired output is
-written as `<sample>_R1.fastq.gz` and `<sample>_R2.fastq.gz`.
-
-For CRAM output, each sample is one `<sample>.cram`; paired mates remain in the
-same file. Enabled unassigned output is `unassigned.cram`. The preserved input
-header gains one uniquely named Plexless `@PG` entry. No CRAM index is created.
-See [CRAM metadata preservation](docs/cram.md#metadata-preservation-policy).
-
-Assigned reads have their declared structured prefixes removed independently
-from each mate, followed by default-on distal pass-through trimming as described
-below. With `--write-unassigned`, unassigned and orphan records are
-written untrimmed to corresponding `unassigned*.fastq.gz` files.
-Because those filenames are reserved, a worklist sample that sanitizes to
-`unassigned` is rejected when unassigned output is enabled.
-
-`--fastq-stats` writes two input-level QC reports. `fastq_stats.tsv` summarizes
-the input suffix after each mate's complete declared prefix, before distal
-trimming (these input-level reports retain their existing meaning).
-`barcode_stats.tsv` summarizes every physical barcode segment separately and
-identifies its mate, symbol, mate-local repeated-piece number, sequencer cycles,
-and declared orientation. Technical `T` segments are excluded from both
-reports. Both reports include read/base counts, length statistics, GC and N
-percentages, mean quality, and Q20/Q30 percentages.
-
-Statistics cover every parsed input record, regardless of whether it is
-assigned, unmatched, ambiguous, unrouted, or orphaned. A mate without a read
-structure is entirely biological. Barcode statistics use the raw observed
-bases and qualities before mismatch correction or reverse-complement
-normalization; orientation is retained as report metadata. `BarcodeSymbol`
-refers to the read-structure symbol, not a decoded whitelist ID, and each row
-aggregates all input observations. `StartCycle` and `EndCycle` are one-based and
-inclusive. For reads shorter than the declared prefix, available barcode cycles
-are counted and the biological observation has length zero. `Reads` in a
-barcode row is the number of parsed records for that mate, including zero-length
-observations when the record ends before that segment.
-
-Every successful run writes `sample_metrics.tsv`, including all worklist
-samples—even those with zero reads. It reports assigned fragments, mate-level
-record and base counts, fractions of the run total and nonzero median, and an
-`OK`, `LOW_REPRESENTATION`, or `MISSING` status. For paired data, one assigned
-fragment means one R1/R2 pair. Missing samples always produce a warning;
-low-representation warnings default to below 5% of the nonzero median.
-
-When output processing starts, Plexless creates `PLEXLESS_INCOMPLETE` in the
-output directory. It removes this marker only after all output writers finish,
-counts reconcile, and optional statistics plus sample metrics are flushed. Any
-failure before that completion point leaves the marker behind, and a later run
-refuses to reuse that nonempty directory. Treat every directory that contains
-the marker as partial output.
-
-Plexless preserves the complete parser-provided read header and trims sequence
-and quality by identical prefix lengths. Output uses a normalized `+` separator
-line; metadata from the input `+` line is not retained.
-
-## Paired-read synchronization
-
-R1 and R2 IDs are normalized and checked before demultiplexing. When one mate
-is missing, Plexless searches ahead up to 1,024 records for the next shared ID,
-emits intervening records as R1 or R2 orphans, and resumes in order. It returns
-an error instead of guessing if synchronization cannot be recovered within the
-window. Orphans are never assigned to a sample or supplied with missing barcode
-pieces.
-
-## Parallelism and compression
-
-`--threads` is a total work budget, not simply a worker count. Plexless accounts
-for FASTQ parser threads, parallel gzip decompression, routing, buffered
-accumulation, and output compression. Buffered FASTQ fixes that allocation at
-startup; it does not dynamically remove compression capacity while running.
-The compiled routing representation is immutable and shared without hot-path
-locks.
-
-`--output-mode auto` selects `direct` below 384 expected output streams and
-`buffered` at 384 or more. A stream is one sample/mate FASTQ, so 192 paired-end
-samples are 384 streams; enabled unassigned outputs are included. Startup logs
-the requested and selected mode. In parallel runs, `direct` compresses each
-batch's populated sample buffers with low coordination overhead; one-thread
-runs write through bounded, long-lived gzip writers instead. `buffered`
-accumulates records across input batches, then parallel-compresses larger
-per-output chunks; this avoids pathological gzip fragmentation at high
-multiplexing. Either mode can be forced for diagnostics or unusual workloads.
-
-For FASTQ input, buffered mode copies parser records once into immutable,
-batch-owned byte blocks and routes compact checked descriptors into one ordered
-accumulator. Trimming is represented by offsets, and records are serialized
-directly into their destination buffers without per-record output allocation.
-The default target is 32 KiB of uncompressed FASTQ per gzip member. One bounded
-ready-job reservoir feeds shared zlib-rs compression workers; completed members
-may finish out of order, but per-output sequence IDs preserve original record
-order without globally ordering unrelated outputs. When the worker budget is
-too small to reserve a dedicated accumulator while retaining routing and
-compression, ordering and accumulation remain combined.
-
-The accumulator memory budget is a pressure limit, not a preallocation. Auto
-sizing reserves a conservative part of currently available memory, capped at
-2 GiB. Bounded queues and compression credits apply backpressure throughout the
-pipeline. CRAM-to-FASTQ retains its separately qualified chunk and scheduling
-policy.
-
-Buffering overrides apply to buffered mode and accept binary byte suffixes such
-as `256K`, `512MiB`, and `2G`.
-Explicit chunks must be 32 KiB–64 MiB and cannot exceed the buffer budget;
-explicit buffer budgets must be at least 1 MiB and no more than half of memory
-currently available at startup.
-
-Output is standard concatenated gzip. The adaptive LRU writer cache uses at
-most 256 files by default, further limited by the process file-descriptor limit
-with 64 descriptors reserved on Linux. Other platforms use the conservative
-256-file cap. Evicted outputs are safely reopened for append.
-
-CRAM input uses rust-htslib/HTSlib background decode workers within the same
-global budget. For FASTQ output, budgets of four or more assign approximately
-one quarter to CRAM decode (capped at eight). CRAM output keeps HTSlib decoding
-inline because controlled measurements found that background decoding reduced
-whole-pipeline throughput. At budgets of eight or more, an ordered coordinator
-dispatches to two destination-owner writer threads; each output CRAM belongs to
-exactly one writer for the entire run. Smaller staged budgets use one combined
-order/writer thread. The remaining budget goes to Plexless routing workers and
-the exact allocation is logged. At a budget of one, the caller thread reads,
-routes, and writes inline. A budget of two reports its one-thread minimum stage
-overcommit.
-
-Unlike concatenated gzip, CRAM output is not reopened for append. Plexless
-preflights all possible output writers plus a 64-descriptor reserve before
-creating the output directory. On Unix it raises a low soft `RLIMIT_NOFILE`
-within the existing hard limit; if the hard limit is insufficient, it fails
-before processing with exact required/soft/hard values. Normal execution
-explicitly finalizes writers, reconciles successful writes, writes reports,
-and removes `PLEXLESS_INCOMPLETE`; it does not decode all output files again.
-The per-owner queues hold at most two ordered batch chunks each, so a hot
-destination applies bounded backpressure rather than consuming unbounded
-memory. Full rereading and `samtools` checks are qualification operations.
-
-Parallel stages share one first-error cancellation state. Worker panics are
-caught at batch or chunk boundaries with stage and unit context; cancellation
-wakes bounded channel operations and worker gates. In-flight batch
-and compression credits are ownership guards, so early returns and panic
-unwinding release them. The process joins every spawned stage and returns the
-original failure instead of reporting a disconnected queue or normal success.
-
-## Limits and validation
-
-- Maximum logical barcode length: 32 bases
-- Barcode symbols: `A-S` and `U-Z`; `T` is reserved
-- Mismatch correction: 0, 1, or 2 substitutions
-- Sample-sheet rows must contain complete paths; partial paths are unsupported
-- Ambiguity stops traversal; path-aware rescue is not yet implemented
-- Paired resynchronization lookahead: 1,024 records
-- Buffered FASTQ-input gzip chunk target: 32 KiB uncompressed
-- CRAM-to-FASTQ automatic gzip chunk target: 128 KiB–1 MiB uncompressed
-- Automatic output buffer budget: 25% of available memory, capped at 2 GiB
-- Automatic output mode: direct below 384 streams; buffered at 384 or more
-- Automatic output writer cache: expected streams, capped at 256 and the safe descriptor limit
-- CRAM input: unmapped records only; missing sequence or quality is rejected
-- Paired CRAM: authoritative queryname grouping and at most one primary R1/R2 per QNAME
-- CRAM output: all potentially populated files remain open; descriptor limits are preflighted and writer memory scales approximately linearly with output count
-
-Startup validation covers read-structure and `(rc)` syntax, required barcode
-sets, barcode bases and logical lengths, duplicate IDs and complete paths,
-unknown sample-sheet IDs, root and sibling sequence conflicts, node-local
-correction safety with parent-path errors, and the 32-base packed-encoding
-limit. Short reads are safely classified as unmatched.
-
-## Architecture and tests
-
-- [`docs/architecture.md`](docs/architecture.md) documents compilation and the
-  batch-owned, allocation-reduced FASTQ hot path.
-- [`docs/cram.md`](docs/cram.md) documents the supported CRAM matrix, validation,
-  metadata transformation contract, and limitations.
-- [`tests/hierarchical_routing.rs`](tests/hierarchical_routing.rs) covers local
-  namespaces, dense-grid selection, correction safety, reuse, and generic symbols.
-- [`tests/scalable_output_qc.rs`](tests/scalable_output_qc.rs) covers high
-  multiplexing, SE/PE ordering, header preservation, and sample QC.
-
-Development checks:
+From the current source checkout, with Rust and the native build dependencies
+installed:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
-cargo build --release --all-targets
-cargo test --release
+cargo install --path . --locked --force
+plexless --version
 ```
+
+See [installation](docs/installation.md) for system prerequisites, source builds,
+and published packages/binaries.
+
+```bash
+plexless --help       # Choose demux or trim
+plexless demux -h     # Common demux options and an example
+plexless trim -h      # Common trim options and examples
+plexless trim --help  # Every trim option, grouped by purpose
+plexless demux --help # Every demux option, including CRAM and tuning
+```
+
+Use a new or empty output directory. Existing outputs are protected from
+overwrite. A `PLEXLESS_INCOMPLETE` marker means a run did not finish successfully.
+The default output is gzip-compressed FASTQ; the [output reference](docs/reference.md#output-behavior)
+explains filenames, reports, and optional output modes.
+
+## Detailed guides
+
+- [Usage reference](docs/reference.md): paired demux, structures, barcode/sample files, routing, outputs, and limits.
+- [Adapters and preprocessing](docs/preprocessing.md): known T sequences, orientation, full/partial matching, filtering, and T7 examples.
+- [Feature guide](docs/fastp-compatibility.md): quality trimming, UMIs, duplicates, merging, reports, streaming, and splitting.
+- [CRAM support](docs/cram.md): accepted inputs and metadata behavior.
+- [Performance and tuning](docs/performance.md): historical measurements, CPU/memory settings, and compression.
+- [Architecture](docs/architecture.md) and [validation report](docs/validation.md): implementation and tests. Current preprocessing changes have correctness comparisons; throughput comparisons remain to be run.
 
 ## License
 
-Plexless is dual-licensed under the Apache License, Version 2.0, or the MIT
-license, at your option. See `LICENSE-APACHE` and `LICENSE-MIT`.
+MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE), and [third-party notices](THIRD_PARTY.md).

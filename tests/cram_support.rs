@@ -77,6 +77,7 @@ fn distal_bounds_reach_cram_fastq_and_metadata_writers() {
                     },
                     format,
                 );
+                options.preprocessing.no_overlap = true; // Sequence-only metadata regression fixture.
                 options.structure = (!paired).then(|| "R1_24A2T".into());
                 options.r1_structure = paired.then(|| "R1_24A2T".into());
                 options.r2_structure = paired.then(|| "R2_24B2T".into());
@@ -150,6 +151,7 @@ fn args(
         output_chunk_size: ByteSizeSetting::Auto,
         output_buffer_memory: ByteSizeSetting::Auto,
         max_open_files: None,
+        preprocessing: Default::default(),
         no_pass_through: false,
         pass_through_mismatches: 1,
         r1_distal_structure: None,
@@ -835,4 +837,142 @@ fn corrupt_cram_decode_failure_retains_incomplete_marker() {
     );
     assert!(output.join("PLEXLESS_INCOMPLETE").is_file());
     assert!(!output.join("sample_metrics.tsv").exists());
+}
+
+#[test]
+fn partial_trimming_and_filtering_share_cram_fastq_and_cram_output_paths() {
+    let test = TestDir::new("cram-preprocessing");
+    let (barcodes, samples) = resources(&test);
+    let adapter = "ACGTTGCACTGATCGAGGTACCTATGCCAGTATCGGATCAACGTGTCACAGTCTAGGACTTCAGAT";
+    let keep = format!("ACGTNNGATTACA{}", &adapter[..30]);
+    let reject = format!("ACGTNNGA{adapter}");
+    let cram = test.child("input.cram");
+    write_cram(
+        &cram,
+        &header(false),
+        &[
+            record(
+                b"keep",
+                SINGLE_UNMAPPED,
+                keep.as_bytes(),
+                &vec![40; keep.len()],
+            ),
+            record(
+                b"reject",
+                SINGLE_UNMAPPED,
+                reject.as_bytes(),
+                &vec![40; reject.len()],
+            ),
+        ],
+    );
+    for threads in [1, 4] {
+        for format in [OutputFormat::Fastq, OutputFormat::Cram] {
+            let out = test.child(&format!("out-{threads}-{format:?}"));
+            let mut options = args(
+                cram.clone(),
+                out.clone(),
+                barcodes.clone(),
+                samples.clone(),
+                ReadMode::Single,
+                format,
+            );
+            options.preprocessing.r1_distal_sequence = Some(adapter.into());
+            options.preprocessing.partial_pass_through = true;
+            options.preprocessing.min_length = Some(5);
+            options.preprocessing.max_n = Some(0);
+            options.fastq_stats = true;
+            plexless::demux::run_with_threads(options, threads).unwrap();
+            match format {
+                OutputFormat::Fastq => assert_eq!(
+                    read_gzip_text(&out.join("sample_1.fastq.gz")),
+                    "@keep\nGATTACA\n+\nIIIIIII\n"
+                ),
+                OutputFormat::Cram => {
+                    let (_, records) = read_cram(&out.join("sample_1.cram"));
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].seq().as_bytes(), b"GATTACA");
+                    assert_eq!(records[0].qual(), &[40; 7]);
+                }
+            }
+            let metrics = std::fs::read_to_string(out.join("preprocessing.tsv")).unwrap();
+            assert!(metrics.contains("fragments_processed\t2\n"));
+            assert!(metrics.contains("fragments_rejected\t1\n"));
+            assert!(metrics.contains("R1_full_adapter_reads\t1\n"));
+            assert!(metrics.contains("R1_partial_adapter_reads\t1\n"));
+        }
+    }
+}
+
+#[test]
+fn duplicate_removal_agrees_for_serial_parallel_and_native_cram() {
+    let test = TestDir::new("cram-dedup");
+    let (barcodes, samples) = resources(&test);
+    for paired in [false, true] {
+        let mut records = Vec::new();
+        for name in [b"first".as_slice(), b"second".as_slice()] {
+            records.push(record(
+                name,
+                if paired {
+                    PAIRED_R1_UNMAPPED
+                } else {
+                    SINGLE_UNMAPPED
+                },
+                b"ACGTNNGATTACA",
+                &[40; 13],
+            ));
+            if paired {
+                records.push(record(name, PAIRED_R2_UNMAPPED, b"TGCATGT", &[40; 7]));
+            }
+        }
+        let input = test.child(&format!("input-{paired}.cram"));
+        write_cram(&input, &header(paired), &records);
+        for threads in [1, 4] {
+            for format in [OutputFormat::Fastq, OutputFormat::Cram] {
+                let out = test.child(&format!("out-{paired}-{threads}-{format:?}"));
+                let mut options = args(
+                    input.clone(),
+                    out.clone(),
+                    barcodes.clone(),
+                    samples.clone(),
+                    if paired {
+                        ReadMode::Paired
+                    } else {
+                        ReadMode::Single
+                    },
+                    format,
+                );
+                options.preprocessing.fastp.dedup = true;
+                options.preprocessing.fastp.duplication_memory_mib = 1;
+                plexless::demux::run_with_threads(options, threads).unwrap();
+                match format {
+                    OutputFormat::Fastq => {
+                        let path = out.join(if paired {
+                            "sample_1_R1.fastq.gz"
+                        } else {
+                            "sample_1.fastq.gz"
+                        });
+                        let text = read_gzip_text(&path);
+                        assert_eq!(text.lines().count(), 4);
+                        assert!(text.starts_with("@first\n"));
+                        if paired {
+                            assert_eq!(
+                                read_gzip_text(&out.join("sample_1_R2.fastq.gz"))
+                                    .lines()
+                                    .count(),
+                                4
+                            );
+                        }
+                    }
+                    OutputFormat::Cram => {
+                        let (_, reads) = read_cram(&out.join("sample_1.cram"));
+                        assert_eq!(reads.len(), if paired { 2 } else { 1 });
+                        assert!(reads.iter().all(|r| r.qname() == b"first"));
+                    }
+                }
+                let metrics = std::fs::read_to_string(out.join("preprocessing.tsv")).unwrap();
+                assert!(metrics.contains("duplicate_fragments\t1\n"));
+                assert!(metrics.contains("fragments_retained\t1\n"));
+            }
+        }
+    }
 }

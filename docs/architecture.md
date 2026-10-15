@@ -25,10 +25,12 @@ sample ID and mate. Compilation reverses segments from the existing extraction
 plans, reconstructing physical bases from the assigned canonical barcode pieces,
 or uses a validated optional distal override. SE assumes symmetric ends; PE uses
 the opposite mate's proximal geometry. Unknown technical segments retain their
-length and become expected-reference masks.
+length and become expected-reference masks. Optional known technical sequences
+replace those masks with mate-specific observed bases, reverse-complemented for
+opposite-mate inference. Explicit distal sequences compile once per mate.
 
 `PassThroughSignature` stores a `u64` anchor/mask, `usize` anchor length and
-offset, boxed verification chunks, a `usize` verification length, and a `u8`
+offset, boxed verification chunks, a `usize` verification length, and a `usize`
 mismatch limit. Each chunk reuses `EncodedBarcode` plus a two-bit known-position
 mask. The detector knows only a sequence slice and signature. Its N-safe rolling
 scan precomputes legal anchor bounds; only exact hits invoke the existing packed
@@ -279,8 +281,9 @@ returns.
 ## Node-local correction safety
 
 Each node independently validates minimum sibling Hamming distance
-`2 * max_mismatches + 1` and independently precomputes exact and correction
-lookups. An error identifies the parent path plus both conflicting IDs.
+`2 * max_mismatches + 1` and builds an exact lookup. Correction indexes are
+precomputed only when the estimated neighborhood fits 1,000,000 entries per node;
+larger neighborhoods use packed Hamming scans over route-local candidates. An error identifies the parent path plus both conflicting IDs.
 
 Consequently, close or identical child sequences are allowed in independent
 parent namespaces. They conflict only when both are candidates in the same
@@ -293,3 +296,48 @@ the same routing position.
 while `RoutingTree` owns traversal and node targets. A future path-aware rescue
 implementation can maintain multiple `(node, score)` states over the same
 compiled representation instead of replacing the extraction or tree model.
+
+
+## Shared preprocessing and trim-only FASTQ
+
+`Preprocessor` owns immutable adapter plans, filter thresholds, and QC selection.
+Demux assigns from the original barcode regions before calling it. Trim constructs
+no router or decoder and uses one destination descriptor to reuse the existing
+bounded FASTQ producer, processing workers, compression, and ordered writer.
+Both paths use the same biological bounds and pair-wide filter decision. The
+serial demux and CRAM adapters also use this preprocessor.
+
+Full matching retains the packed exact anchor and chunked Hamming verifier.
+Known mate-specific T bases are loaded once; explicit assignment-independent
+adapters compile once per mate. Optional partial matching uses startup-compiled
+multiword Shift-And masks over bounded 3-prime suffixes, with exact known bases
+and separate evidence/complexity requirements. Filtering and retained QC share
+one base scan. Batch metrics merge without touching output ordering or credits.
+See [preprocessing.md](preprocessing.md) for algorithms, orientation, output
+semantics, complexity, and validation examples.
+
+## Shared preprocessing and fastp-derived features
+
+`Preprocessor` owns startup-compiled signatures, filter policy and index lists.
+Demux routes original barcode regions before shared biological bounds; trim uses
+one synthetic output descriptor and no routing tree. Paired bounds use unique
+packed mate overlap by default. `--no-overlap` restores independent sequence-only
+matching. Full adapters require the configurable 20-known-base evidence floor;
+partial matching remains an exact, optional bounded suffix/prefix automaton.
+
+Quality bounds, polyG/polyX and fixed clipping are in `quality_trim`; packed
+overlap and its optional adapter-only single-gap fallback are in `overlap`;
+mutable quality-supported correction and consensus merging are in `read_ops`.
+The existing ordered pipeline supplies owned records only for features needing
+mutable sequence/headers or auxiliary output. `fastp_runtime` handles UMI/header
+normalization and producer-ordered duplication: bounded Bloom estimates never
+remove reads, while exact keys spill from memory into temporary SQLite.
+
+`distribution`, `overrepresentation` and `report` provide optional detailed
+curves, bounded sampled heavy hitters, and standalone JSON/HTML. Core summary QC
+and filtering share a scan. Splitting carries part numbers through ordered
+compression jobs and splits serialized records before compression. No separate
+trim reader, adapter matcher, compression scheduler or per-sample writer exists.
+`parallel.rs` retains its existing orchestration; this work adds the hooks needed
+for these features without an unrelated module reorganization. Full defaults,
+resources and deliberate fastp differences are in `fastp-compatibility.md`.

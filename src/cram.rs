@@ -884,6 +884,9 @@ impl CramWriterManager {
 
     fn open_writer(&mut self, target: OutputTarget) -> Result<(), String> {
         let name = match target {
+            OutputTarget::Merged { .. } | OutputTarget::Auxiliary { .. } => {
+                return Err("Extra FASTQ outputs cannot be written as native CRAM".into());
+            }
             OutputTarget::Sample { sample_id } => self
                 .sample_names
                 .get(usize::try_from(sample_id).map_err(|_| "Invalid sample ID")?)
@@ -910,6 +913,9 @@ pub(crate) fn output_target_shard(
         return Err("CRAM writer shard count must be greater than zero".into());
     }
     let target_index = match target {
+        OutputTarget::Merged { .. } | OutputTarget::Auxiliary { .. } => {
+            return Err("Extra FASTQ outputs cannot be sharded as native CRAM".into());
+        }
         OutputTarget::Sample { sample_id } => {
             let index = usize::try_from(sample_id).map_err(|_| "Invalid sample ID")?;
             if index >= sample_count {

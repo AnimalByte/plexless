@@ -7,6 +7,7 @@ use crate::cli::{DemuxArgs, OutputFormat, ReadMode};
 #[derive(Debug)]
 pub(crate) enum InputFiles {
     Single(PathBuf),
+    Interleaved(PathBuf),
     Paired { r1: PathBuf, r2: PathBuf },
 }
 
@@ -45,12 +46,12 @@ impl InputSource {
 
 impl InputFiles {
     pub(crate) fn is_paired(&self) -> bool {
-        matches!(self, Self::Paired { .. })
+        matches!(self, Self::Paired { .. } | Self::Interleaved(_))
     }
 
     pub(crate) fn has_gzip(&self) -> Result<bool, String> {
         match self {
-            Self::Single(path) => is_gzip_file(path),
+            Self::Single(path) | Self::Interleaved(path) => is_gzip_file(path),
             Self::Paired { r1, r2 } => Ok(is_gzip_file(r1)? || is_gzip_file(r2)?),
         }
     }
@@ -71,7 +72,11 @@ pub(crate) fn resolve_inputs(args: &DemuxArgs) -> Result<InputFiles, String> {
             .as_deref()
             .ok_or("Missing single-end FASTQ input")?;
         validate_input_path(reads)?;
-        Ok(InputFiles::Single(reads.to_path_buf()))
+        if args.preprocessing.fastp.interleaved_in {
+            Ok(InputFiles::Interleaved(reads.to_path_buf()))
+        } else {
+            Ok(InputFiles::Single(reads.to_path_buf()))
+        }
     }
 }
 
@@ -92,12 +97,18 @@ pub(crate) fn resolve_input_source(args: &DemuxArgs) -> Result<InputSource, Stri
 }
 
 fn validate_input_path(path: &Path) -> Result<(), String> {
+    if path == Path::new("-") {
+        return Ok(());
+    }
     fs::metadata(path)
         .map(|_| ())
         .map_err(|e| format!("Could not access input '{}': {e}", path.display()))
 }
 
 pub(crate) fn is_gzip_file(path: &Path) -> Result<bool, String> {
+    if path == Path::new("-") {
+        return Ok(false);
+    }
     let mut file = fs::File::open(path)
         .map_err(|e| format!("Could not inspect input '{}': {e}", path.display()))?;
     let mut magic = [0u8; 2];

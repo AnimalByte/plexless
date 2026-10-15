@@ -36,7 +36,7 @@ struct CompiledNode {
 pub struct RoutingTree {
     representation: RoutingRepresentation,
     extraction: BarcodeExtractionPlans,
-    pub(crate) pass_through: crate::pass_through::PassThroughPlans,
+    pub(crate) preprocessing: crate::preprocessing::Preprocessor,
 }
 
 #[derive(Debug)]
@@ -125,7 +125,7 @@ impl RoutingTree {
         Ok(Self {
             representation,
             extraction,
-            pass_through: Default::default(),
+            preprocessing: Default::default(),
         })
     }
 

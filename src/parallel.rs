@@ -20,12 +20,14 @@ use crate::cram::{
 use crate::demux::{DemuxCounts, core_read_id, print_summary, write_fastq_stats};
 use crate::input::{InputFiles, InputSource};
 use crate::output::{
-    CompressionFlushReason, CompressionJob, OutputAccumulator, OutputKey, OutputLayout, OutputMate,
-    OutputTarget, ResolvedOutputMode, available_memory_bytes, calculate_fastq_output_buffer_policy,
-    calculate_output_buffer_policy, report_output_mode, resolve_output_mode,
+    AuxiliaryStream, CompressionFlushReason, CompressionJob, OutputAccumulator, OutputKey,
+    OutputLayout, OutputMate, OutputTarget, ResolvedOutputMode, available_memory_bytes,
+    calculate_fastq_output_buffer_policy, calculate_output_buffer_policy, report_output_mode,
+    resolve_output_mode,
 };
 use crate::parallel_input::ParallelInput;
 use crate::pass_through::{BiologicalBounds, PassThroughPlans};
+use crate::preprocessing::Preprocessor;
 use crate::qc::{SampleQc, SampleQcSummary};
 use crate::routing::{RouteResult, RoutingTree};
 use crate::samples::SampleSheet;
@@ -783,6 +785,8 @@ fn describe_output_key(key: OutputKey) -> String {
     let target = match key.target {
         OutputTarget::Sample { sample_id } => format!("sample {sample_id}"),
         OutputTarget::Unassigned => "unassigned output".into(),
+        OutputTarget::Merged { sample_id } => format!("merged sample {sample_id}"),
+        OutputTarget::Auxiliary { stream } => format!("{} output", stream.name()),
     };
     let mate = match key.mate {
         OutputMate::Single => "single-end",
@@ -949,7 +953,8 @@ fn compression_outstanding_limit(
 }
 
 struct SharedState {
-    routing: RoutingTree,
+    routing: Option<RoutingTree>,
+    preprocessing: Preprocessor,
     output_layout: OutputLayout,
     r1_prefix: usize,
     r2_prefix: usize,
@@ -1173,6 +1178,7 @@ struct WorkBatch {
     items: Vec<WorkItem>,
     fastq_backings: Vec<Arc<FastqReadBlock>>,
     permit: PermitGuard,
+    duplicates: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -1181,6 +1187,7 @@ struct BufferedOutput {
     fastq: Vec<u8>,
     records: u64,
     bases: u64,
+    fragments: u64,
 }
 
 #[derive(Debug)]
@@ -1229,6 +1236,7 @@ struct DirectCompressedOutput {
     records: u64,
     bases: u64,
     uncompressed_len: usize,
+    fragments: u64,
 }
 
 #[derive(Debug)]
@@ -1248,6 +1256,7 @@ struct QueuedCompressionJob {
 
 #[derive(Debug)]
 struct CompressedChunk {
+    part: u64,
     key: OutputKey,
     chunk_id: u64,
     member: Vec<u8>,
@@ -1276,6 +1285,7 @@ struct OutputBuffer {
     fastq: Vec<u8>,
     records: u64,
     bases: u64,
+    fragments: u64,
 }
 
 struct BatchBuffers {
@@ -1298,6 +1308,23 @@ impl BatchBuffers {
         record: &OwnedFastqRecord,
         bounds: BiologicalBounds,
     ) -> Result<(), String> {
+        self.push_weighted(
+            target,
+            mate,
+            record,
+            bounds,
+            u64::from(mate != OutputMate::R2),
+        )
+    }
+    fn push_weighted(
+        &mut self,
+        target: OutputTarget,
+        mate: OutputMate,
+        record: &OwnedFastqRecord,
+        bounds: BiologicalBounds,
+        fragments: u64,
+    ) -> Result<(), String> {
+        let target = self.layout.canonical_target(target);
         if bounds.start > bounds.end
             || bounds.end > record.seq.len()
             || bounds.end > record.qual.len()
@@ -1328,6 +1355,7 @@ impl BatchBuffers {
         buffer.fastq.extend_from_slice(b"\n+\n");
         buffer.fastq.extend_from_slice(qual);
         buffer.fastq.extend_from_slice(b"\n");
+        buffer.fragments += fragments;
         buffer.records = buffer
             .records
             .checked_add(1)
@@ -1351,6 +1379,7 @@ impl BatchBuffers {
                     fastq: buffer.fastq,
                     records: buffer.records,
                     bases: buffer.bases,
+                    fragments: buffer.fragments,
                 })
             })
             .collect()
@@ -1362,6 +1391,11 @@ struct BatchSender {
     permits: Receiver<()>,
     permit_returns: Sender<()>,
     next_batch_id: u64,
+    processed_fragments: u64,
+    read_limit: u64,
+    duplicates: Vec<bool>,
+    duplicate_catalog: Option<crate::fastp_runtime::DuplicateCatalog>,
+    verbose: bool,
     items: Vec<WorkItem>,
     fastq_backings: Vec<Arc<FastqReadBlock>>,
     allocation: Option<AllocationController>,
@@ -1380,6 +1414,11 @@ impl BatchSender {
             permits,
             permit_returns,
             next_batch_id: 0,
+            processed_fragments: 0,
+            read_limit: 0,
+            duplicates: Vec::with_capacity(BATCH_SIZE),
+            duplicate_catalog: None,
+            verbose: false,
             items: Vec::with_capacity(BATCH_SIZE),
             fastq_backings: Vec::new(),
             allocation: None,
@@ -1400,7 +1439,46 @@ impl BatchSender {
         }
     }
 
+    fn configure(&mut self, o: &crate::fastp_options::FastpOptions) -> Result<(), String> {
+        self.read_limit = o.reads_to_process;
+        self.verbose = o.verbose;
+        self.duplicate_catalog = crate::fastp_runtime::DuplicateCatalog::configured(o)?;
+        Ok(())
+    }
+    fn limit_reached(&self) -> bool {
+        self.read_limit > 0 && self.processed_fragments >= self.read_limit
+    }
     fn push(&mut self, item: WorkItem) -> Result<(), String> {
+        let parts = match &item {
+            WorkItem::Single(r) => Some((r.seq.as_slice(), None)),
+            WorkItem::Pair { r1, r2 } => Some((r1.seq.as_slice(), Some(r2.seq.as_slice()))),
+            WorkItem::BatchSingle(r) => {
+                Some((resolve_batch_record(&self.fastq_backings, *r)?.seq, None))
+            }
+            WorkItem::BatchPair { r1, r2 } => Some((
+                resolve_batch_record(&self.fastq_backings, *r1)?.seq,
+                Some(resolve_batch_record(&self.fastq_backings, *r2)?.seq),
+            )),
+            WorkItem::CramSingle(r) => Some((r.read.seq.as_slice(), None)),
+            WorkItem::CramPair { r1, r2, .. } => {
+                Some((r1.read.seq.as_slice(), Some(r2.read.seq.as_slice())))
+            }
+            _ => None,
+        };
+        let mut duplicate = false;
+        if let Some((a, b)) = parts {
+            if self.limit_reached() {
+                return Ok(());
+            }
+            self.processed_fragments += 1;
+            if self.verbose && self.processed_fragments.is_multiple_of(1_000_000) {
+                eprintln!("Input fragments processed: {}", self.processed_fragments);
+            }
+            if let Some(catalog) = &mut self.duplicate_catalog {
+                duplicate = catalog.observe(a, b)?;
+            }
+        }
+        self.duplicates.push(duplicate);
         self.items.push(item);
 
         if self.items.len() >= BATCH_SIZE {
@@ -1486,6 +1564,7 @@ impl BatchSender {
         let permit = acquire_permit(&self.permits, &self.permit_returns, &self.control, "batch")?;
         let batch = WorkBatch {
             id: self.next_batch_id,
+            duplicates: std::mem::replace(&mut self.duplicates, Vec::with_capacity(BATCH_SIZE)),
             items,
             fastq_backings,
             permit,
@@ -1707,6 +1786,9 @@ impl CramSerialFastqWriter {
             .get(bounds.range())
             .ok_or("Internal error: CRAM FASTQ trim exceeds quality length")?;
         match (self, target) {
+            (_, OutputTarget::Merged { .. } | OutputTarget::Auxiliary { .. }) => {
+                Err("Extra FASTQ streams cannot enter CRAM adapters".into())
+            }
             (Self::Direct(writer), OutputTarget::Sample { sample_id }) => {
                 writer.write_sample(sample_id, mate, &record.id, seq, qual)
             }
@@ -1784,19 +1866,37 @@ fn run_cram_fastq_serial(
     };
     let run_marker = OutputRunMarker::begin(&output_dir)?;
     let mut counts = DemuxCounts::default();
+    let mut duplicates =
+        crate::fastp_runtime::DuplicateCatalog::configured(&args.preprocessing.fastp)?;
 
     crate::cram::read_items(path, mode, 0, |item| match item {
         CramInputItem::Single(record) => {
+            let duplicate = duplicates
+                .as_mut()
+                .map(|catalog| catalog.observe(&record.read.seq, None))
+                .transpose()?
+                .unwrap_or(false);
+            counts
+                .preprocessing
+                .set_duplicate(duplicate, args.preprocessing.fastp.dedup);
             if let Some(stats) = r1_stats.as_mut() {
                 stats.update(&record.read.seq, &record.read.qual)?;
             }
             let (target, bounds) = route_single_record(&record.read, &state, &mut counts)?;
-            if should_emit(target, state.write_unassigned) {
+            if let Some(target) = emitted_target(target, state.write_unassigned) {
                 writer.write(target, OutputMate::Single, &record.read, bounds)?;
             }
             Ok(())
         }
         CramInputItem::Pair { r1, r2, .. } => {
+            let duplicate = duplicates
+                .as_mut()
+                .map(|catalog| catalog.observe(&r1.read.seq, Some(&r2.read.seq)))
+                .transpose()?
+                .unwrap_or(false);
+            counts
+                .preprocessing
+                .set_duplicate(duplicate, args.preprocessing.fastp.dedup);
             if let Some(stats) = r1_stats.as_mut() {
                 stats.update(&r1.read.seq, &r1.read.qual)?;
             }
@@ -1805,7 +1905,7 @@ fn run_cram_fastq_serial(
             }
             let (target, r1_bounds, r2_bounds) =
                 route_pair_records(&r1.read, &r2.read, &state, &mut counts)?;
-            if should_emit(target, state.write_unassigned) {
+            if let Some(target) = emitted_target(target, state.write_unassigned) {
                 writer.write(target, OutputMate::R1, &r1.read, r1_bounds)?;
                 writer.write(target, OutputMate::R2, &r2.read, r2_bounds)?;
             }
@@ -1842,7 +1942,9 @@ fn run_cram_fastq_serial(
     })?;
 
     let completion = writer.finish()?;
-    completion.sample_qc.verify(counts.assigned)?;
+    completion
+        .sample_qc
+        .verify(counts.assigned - counts.preprocessing.assigned_rejected)?;
     verify_unassigned_output_counts(
         &counts,
         paired,
@@ -1856,6 +1958,12 @@ fn run_cram_fastq_serial(
         completion
             .sample_qc
             .write_report(&output_dir, &samples, args.low_sample_fraction)?;
+    counts.write_preprocessing_reports(&output_dir, paired, args.fastq_stats)?;
+    crate::report::write(
+        &args.preprocessing.fastp,
+        [r1_stats.as_ref(), r2_stats.as_ref()],
+        &counts.preprocessing,
+    )?;
     run_marker.complete()?;
     print_summary(&counts);
     print_sample_summary(qc_summary);
@@ -1895,6 +2003,8 @@ fn run_cram_output_serial(
     )?;
     let run_marker = OutputRunMarker::begin(&output_dir)?;
     let mut counts = DemuxCounts::default();
+    let mut duplicates =
+        crate::fastp_runtime::DuplicateCatalog::configured(&args.preprocessing.fastp)?;
     let mut sample_qc = SampleQc::new(samples.samples.len(), paired);
     let mut unassigned_records = 0u64;
     let mut accounted_records = 0u64;
@@ -1902,17 +2012,36 @@ fn run_cram_output_serial(
     crate::cram::read_items(path, mode, 0, |input| {
         let item = match input {
             CramInputItem::Single(record) => {
+                let duplicate = duplicates
+                    .as_mut()
+                    .map(|catalog| catalog.observe(&record.read.seq, None))
+                    .transpose()?
+                    .unwrap_or(false);
+                counts
+                    .preprocessing
+                    .set_duplicate(duplicate, args.preprocessing.fastp.dedup);
                 if let Some(stats) = r1_stats.as_mut() {
                     stats.update(&record.read.seq, &record.read.qual)?;
                 }
                 let (target, bounds) = route_single_record(&record.read, &state, &mut counts)?;
-                should_emit(target, state.write_unassigned).then_some(CramOutputItem::Single {
-                    target,
-                    record,
-                    bounds,
+                emitted_target(target, state.write_unassigned).map(|target| {
+                    CramOutputItem::Single {
+                        target,
+                        record,
+                        bounds,
+                    }
                 })
             }
             CramInputItem::Pair { r1, r2, r1_first } => {
+                let duplicate = duplicates
+                    .as_mut()
+                    .map(|catalog| catalog.observe(&r1.read.seq, Some(&r2.read.seq)))
+                    .transpose()?
+                    .unwrap_or(false);
+                counts
+                    .preprocessing
+                    .set_duplicate(duplicate, args.preprocessing.fastp.dedup);
+
                 if let Some(stats) = r1_stats.as_mut() {
                     stats.update(&r1.read.seq, &r1.read.qual)?;
                 }
@@ -1921,7 +2050,7 @@ fn run_cram_output_serial(
                 }
                 let (target, r1_bounds, r2_bounds) =
                     route_pair_records(&r1.read, &r2.read, &state, &mut counts)?;
-                should_emit(target, state.write_unassigned).then_some(CramOutputItem::Pair {
+                emitted_target(target, state.write_unassigned).map(|target| CramOutputItem::Pair {
                     target,
                     r1,
                     r2,
@@ -1977,7 +2106,7 @@ fn run_cram_output_serial(
         ));
     }
     let report_started = Instant::now();
-    sample_qc.verify(counts.assigned)?;
+    sample_qc.verify(counts.assigned - counts.preprocessing.assigned_rejected)?;
     verify_unassigned_output_counts(&counts, paired, args.write_unassigned, unassigned_records)?;
     if let Some(r1) = &r1_stats {
         write_fastq_stats(&output_dir, r1, r2_stats.as_ref())?;
@@ -1985,6 +2114,12 @@ fn run_cram_output_serial(
     let qc_summary = sample_qc.write_report(&output_dir, &samples, args.low_sample_fraction)?;
     metadata.write_report(&output_dir)?;
     let report_time = report_started.elapsed();
+    counts.write_preprocessing_reports(&output_dir, paired, args.fastq_stats)?;
+    crate::report::write(
+        &args.preprocessing.fastp,
+        [r1_stats.as_ref(), r2_stats.as_ref()],
+        &counts.preprocessing,
+    )?;
     run_marker.complete()?;
     print_summary(&counts);
     print_sample_summary(qc_summary);
@@ -2083,6 +2218,19 @@ impl AllocationController {
 }
 
 pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result<(), String> {
+    run_pipeline(args, threads, input, false)
+}
+
+pub(crate) fn run_trim(args: DemuxArgs, threads: usize, input: InputSource) -> Result<(), String> {
+    run_pipeline(args, threads, input, true)
+}
+
+fn run_pipeline(
+    args: DemuxArgs,
+    threads: usize,
+    input: InputSource,
+    trim: bool,
+) -> Result<(), String> {
     if threads == 0 {
         return Err("Parallel pipeline requires at least 1 worker thread".into());
     }
@@ -2104,17 +2252,60 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
         ReadLayout::single(args.structure.as_deref())?
     };
 
-    let catalog = BarcodeCatalog::load(&args.barcodes, &layout)?;
-    let samples = SampleSheet::load(&args.samples, &layout, &catalog)?;
-    let mut routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
-    routing.pass_through = PassThroughPlans::compile(&layout, &catalog, &samples, &args)?;
-    let (r1_qc, r2_qc) = MateQcStats::for_layout(&layout);
+    if paired && args.structure.is_some() {
+        return Err("Use --r1-structure/--r2-structure for paired input".into());
+    }
+    if !paired && (args.r1_structure.is_some() || args.r2_structure.is_some()) {
+        return Err("Use --structure for single-end input".into());
+    }
+    let (routing, samples, adapters) = if trim {
+        layout.compile_extraction_plans()?; // Validate logical lengths without extracting or decoding barcodes.
+        (
+            None,
+            SampleSheet {
+                samples: vec![crate::samples::Sample {
+                    name: "trimmed".into(),
+                    barcode_ids: Vec::new(),
+                }],
+            },
+            PassThroughPlans::compile_trim(&layout, &args)?,
+        )
+    } else {
+        let catalog = BarcodeCatalog::load(&args.barcodes, &layout)?;
+        let samples = SampleSheet::load(&args.samples, &layout, &catalog)?;
+        let routing = RoutingTree::new(&layout, &catalog, &samples, args.max_mismatches)?;
+        let adapters = PassThroughPlans::compile(&layout, &catalog, &samples, &args)?;
+        (Some(routing), samples, adapters)
+    };
+    let preprocessing = Preprocessor::new(adapters, args.preprocessing.clone(), args.fastq_stats)?;
+    let (mut r1_qc, mut r2_qc) = MateQcStats::for_layout(&layout);
+    if args.preprocessing.fastp.json.is_some() || args.preprocessing.fastp.html.is_some() {
+        r1_qc.enable_detailed();
+        if let Some(qc) = r2_qc.as_mut() {
+            qc.enable_detailed();
+        }
+    }
+    if args.preprocessing.fastp.overrepresentation_analysis {
+        r1_qc.enable_overrepresentation(args.preprocessing.fastp.overrepresentation_sampling);
+        if let Some(qc) = r2_qc.as_mut() {
+            qc.enable_overrepresentation(args.preprocessing.fastp.overrepresentation_sampling);
+        }
+    }
     let mut r1_stats = args.fastq_stats.then_some(r1_qc);
     let mut r2_stats = if args.fastq_stats { r2_qc } else { None };
-    let (r1_prefix, r2_prefix) = (routing.r1_prefix_len(), routing.r2_prefix_len());
-    let output_layout = OutputLayout::new(samples.samples.len(), paired, args.write_unassigned);
+    let proximal = crate::technical::structures(&layout);
+    let (r1_prefix, r2_prefix) = (
+        proximal[0].map_or(0, |s| s.prefix_len),
+        proximal[1].map_or(0, |s| s.prefix_len),
+    );
+    let output_layout = OutputLayout::new(samples.samples.len(), paired, args.write_unassigned)
+        .with_fastp(&args.preprocessing.fastp);
     let expected_streams = output_layout.stream_count()?;
-    let output_mode = resolve_output_mode(args.output_mode, expected_streams)?;
+    let output_mode = if args.preprocessing.fastp.split_records > 0 {
+        ResolvedOutputMode::Buffered
+    } else {
+        resolve_output_mode(args.output_mode, expected_streams)?
+    };
     if matches!(input, InputSource::Fastq(_)) {
         report_output_mode(args.output_mode, output_mode, expected_streams);
         report_thread_allocation(thread_plan, output_mode);
@@ -2141,6 +2332,7 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
 
     let state = SharedState {
         routing,
+        preprocessing,
         output_layout,
         r1_prefix,
         r2_prefix,
@@ -2180,11 +2372,13 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
         };
     }
 
-    let parallel_input = ParallelInput::new(
+    let mut parallel_input = ParallelInput::new(
         thread_plan.max_input_threads,
         thread_plan.initial_input_threads,
         thread_plan.parallel_gzip,
     )?;
+    parallel_input.phred64 = args.preprocessing.fastp.phred64;
+    parallel_input.read_limit = args.preprocessing.fastp.reads_to_process;
     let worker_threads = thread_plan.initial_worker_threads;
     let worker_headroom = thread_plan.worker_headroom;
 
@@ -2244,7 +2438,7 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
     );
 
     let output_dir = args.output.clone();
-    let writer = CompressedWriterManager::new(
+    let mut writer = CompressedWriterManager::new(
         args.output.clone(),
         &samples,
         paired,
@@ -2252,6 +2446,7 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
         max_open_files,
         args.compression_level,
     )?;
+    writer.configure_fastp(&args.preprocessing.fastp)?;
     let run_marker = OutputRunMarker::begin(&output_dir)?;
 
     let queue_capacity = worker_threads
@@ -2488,7 +2683,16 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
                 }
             };
 
+            batcher.configure(&args.preprocessing.fastp)?;
             let producer_result = stage_boundary(&control, "Input producer", || match &input {
+                InputSource::Fastq(InputFiles::Interleaved(path)) => produce_interleaved(
+                    path,
+                    &mut batcher,
+                    r1_stats.as_mut(),
+                    r2_stats.as_mut(),
+                    &parallel_input,
+                    &control,
+                ),
                 InputSource::Fastq(InputFiles::Single(path)) => produce_batch_owned_single(
                     path,
                     &mut batcher,
@@ -2603,7 +2807,9 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
         telemetry.report();
     }
     let counts = aggregation.counts;
-    aggregation.sample_qc.verify(counts.assigned)?;
+    aggregation
+        .sample_qc
+        .verify(counts.assigned - counts.preprocessing.assigned_rejected)?;
     verify_unassigned_output_counts(
         &counts,
         paired,
@@ -2615,15 +2821,38 @@ pub(crate) fn run(args: DemuxArgs, threads: usize, input: InputSource) -> Result
         write_fastq_stats(&output_dir, r1, r2_stats.as_ref())?;
     }
 
-    let qc_summary =
-        aggregation
-            .sample_qc
-            .write_report(&output_dir, &samples, args.low_sample_fraction)?;
+    let qc_summary = if trim {
+        None
+    } else {
+        Some(
+            aggregation
+                .sample_qc
+                .write_report(&output_dir, &samples, args.low_sample_fraction)?,
+        )
+    };
+    if trim {
+        crate::trim::ensure_outputs(
+            &output_dir,
+            paired,
+            args.compression_level,
+            &args.preprocessing.fastp,
+        )?;
+    }
 
+    counts.write_preprocessing_reports(&output_dir, paired, args.fastq_stats)?;
+    crate::report::write(
+        &args.preprocessing.fastp,
+        [r1_stats.as_ref(), r2_stats.as_ref()],
+        &counts.preprocessing,
+    )?;
     run_marker.complete()?;
 
-    print_summary(&counts);
-    print_sample_summary(qc_summary);
+    if let Some(qc_summary) = qc_summary {
+        print_summary(&counts);
+        print_sample_summary(qc_summary);
+    } else {
+        crate::trim::print_summary(&counts);
+    }
     print_chunk_summary(aggregation.uncompressed_bytes, &writer_result);
 
     Ok(())
@@ -2643,9 +2872,10 @@ fn run_direct_parallel(
     mut r1_stats: Option<MateQcStats>,
     mut r2_stats: Option<MateQcStats>,
 ) -> Result<(), String> {
+    let trim = state.routing.is_none();
     let output_dir = args.output.clone();
     eprintln!("Output writers: max-open-files={max_open_files}");
-    let writer = CompressedWriterManager::new(
+    let mut writer = CompressedWriterManager::new(
         args.output.clone(),
         &samples,
         paired,
@@ -2653,6 +2883,7 @@ fn run_direct_parallel(
         max_open_files,
         args.compression_level,
     )?;
+    writer.configure_fastp(&args.preprocessing.fastp)?;
     let run_marker = OutputRunMarker::begin(&output_dir)?;
     let worker_threads = thread_plan.initial_worker_threads;
     let worker_headroom = thread_plan.worker_headroom;
@@ -2731,7 +2962,16 @@ fn run_direct_parallel(
                     BatchSender::new(work_tx, batch_permit_rx, batch_permit_tx, control.clone())
                 }
             };
+            batcher.configure(&args.preprocessing.fastp)?;
             let producer_result = stage_boundary(&control, "Input producer", || match &input {
+                InputSource::Fastq(InputFiles::Interleaved(path)) => produce_interleaved(
+                    path,
+                    &mut batcher,
+                    r1_stats.as_mut(),
+                    r2_stats.as_mut(),
+                    &parallel_input,
+                    &control,
+                ),
                 InputSource::Fastq(InputFiles::Single(path)) => produce_single(
                     path,
                     &mut batcher,
@@ -2818,7 +3058,9 @@ fn run_direct_parallel(
 
     let (aggregation, writer_result) = pipeline_result?;
     let counts = aggregation.counts;
-    aggregation.sample_qc.verify(counts.assigned)?;
+    aggregation
+        .sample_qc
+        .verify(counts.assigned - counts.preprocessing.assigned_rejected)?;
     verify_unassigned_output_counts(
         &counts,
         paired,
@@ -2828,13 +3070,36 @@ fn run_direct_parallel(
     if let Some(r1) = &r1_stats {
         write_fastq_stats(&output_dir, r1, r2_stats.as_ref())?;
     }
-    let qc_summary =
-        aggregation
-            .sample_qc
-            .write_report(&output_dir, &samples, args.low_sample_fraction)?;
+    let qc_summary = if trim {
+        None
+    } else {
+        Some(
+            aggregation
+                .sample_qc
+                .write_report(&output_dir, &samples, args.low_sample_fraction)?,
+        )
+    };
+    if trim {
+        crate::trim::ensure_outputs(
+            &output_dir,
+            paired,
+            args.compression_level,
+            &args.preprocessing.fastp,
+        )?;
+    }
+    counts.write_preprocessing_reports(&output_dir, paired, args.fastq_stats)?;
+    crate::report::write(
+        &args.preprocessing.fastp,
+        [r1_stats.as_ref(), r2_stats.as_ref()],
+        &counts.preprocessing,
+    )?;
     run_marker.complete()?;
-    print_summary(&counts);
-    print_sample_summary(qc_summary);
+    if let Some(qc_summary) = qc_summary {
+        print_summary(&counts);
+        print_sample_summary(qc_summary);
+    } else {
+        crate::trim::print_summary(&counts);
+    }
     print_chunk_summary(aggregation.uncompressed_bytes, &writer_result);
     Ok(())
 }
@@ -2943,6 +3208,7 @@ fn run_cram_output_parallel(
 
             let mut batcher =
                 BatchSender::new(work_tx, batch_permit_rx, batch_permit_tx, control.clone());
+            batcher.configure(&args.preprocessing.fastp)?;
             let producer_result = stage_boundary(&control, "CRAM input producer", || {
                 produce_cram(
                     path,
@@ -3009,7 +3275,9 @@ fn run_cram_output_parallel(
 
     let aggregation = pipeline_result?;
     let report_started = Instant::now();
-    aggregation.sample_qc.verify(aggregation.counts.assigned)?;
+    aggregation
+        .sample_qc
+        .verify(aggregation.counts.assigned - aggregation.counts.preprocessing.assigned_rejected)?;
     verify_unassigned_output_counts(
         &aggregation.counts,
         paired,
@@ -3025,6 +3293,14 @@ fn run_cram_output_parallel(
             .write_report(&output_dir, &samples, args.low_sample_fraction)?;
     aggregation.metadata.write_report(&output_dir)?;
     let report_time = report_started.elapsed();
+    aggregation
+        .counts
+        .write_preprocessing_reports(&output_dir, paired, args.fastq_stats)?;
+    crate::report::write(
+        &args.preprocessing.fastp,
+        [r1_stats.as_ref(), r2_stats.as_ref()],
+        &aggregation.counts.preprocessing,
+    )?;
     run_marker.complete()?;
     print_summary(&aggregation.counts);
     print_sample_summary(qc_summary);
@@ -3106,19 +3382,24 @@ fn process_cram_batch(batch: WorkBatch, state: &SharedState) -> Result<CramProce
         items,
         fastq_backings,
         permit,
+        duplicates,
     } = batch;
     if !fastq_backings.is_empty() {
         return Err("Internal error: FASTQ backing storage reached CRAM output adapter".into());
     }
     let mut outputs = Vec::with_capacity(items.len());
     let mut counts = DemuxCounts::default();
-    for item in items {
+    for (item_index, item) in items.into_iter().enumerate() {
+        counts.preprocessing.set_duplicate(
+            duplicates.get(item_index).copied().unwrap_or(false),
+            state.preprocessing.options.fastp.dedup,
+        );
         match item {
             WorkItem::CramSingle(record) => {
                 let route = route_single_record(&record.read, state, &mut counts)?;
-                if should_emit(route.0, state.write_unassigned) {
+                if let Some(target) = emitted_target(route.0, state.write_unassigned) {
                     outputs.push(CramOutputItem::Single {
-                        target: route.0,
+                        target,
                         record,
                         bounds: route.1,
                     });
@@ -3127,7 +3408,7 @@ fn process_cram_batch(batch: WorkBatch, state: &SharedState) -> Result<CramProce
             WorkItem::CramPair { r1, r2, r1_first } => {
                 let (target, r1_bounds, r2_bounds) =
                     route_pair_records(&r1.read, &r2.read, state, &mut counts)?;
-                if should_emit(target, state.write_unassigned) {
+                if let Some(target) = emitted_target(target, state.write_unassigned) {
                     outputs.push(CramOutputItem::Pair {
                         target,
                         r1,
@@ -3500,6 +3781,9 @@ fn observe_cram_output(
 ) -> Result<(), String> {
     let CramOutputObservation { target, records } = observation;
     match target {
+        OutputTarget::Merged { .. } | OutputTarget::Auxiliary { .. } => {
+            return Err("Extra FASTQ streams cannot enter CRAM observations".into());
+        }
         OutputTarget::Sample { sample_id } => {
             for (mate, bases) in records {
                 sample_qc.observe_output(
@@ -3577,18 +3861,24 @@ fn process_direct_batch(
         .into_iter()
         .map(|output| {
             let uncompressed_len = output.fastq.len();
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::new(compression_level));
-            encoder
-                .write_all(&output.fastq)
-                .map_err(|error| format!("Could not compress direct FASTQ batch: {error}"))?;
-            let member = encoder
-                .finish()
-                .map_err(|error| format!("Could not finish direct FASTQ member: {error}"))?;
+            let member = if state.output_layout.gzip(output.key) {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::new(compression_level));
+                encoder
+                    .write_all(&output.fastq)
+                    .map_err(|error| format!("Could not compress direct FASTQ batch: {error}"))?;
+
+                encoder
+                    .finish()
+                    .map_err(|error| format!("Could not finish direct FASTQ member: {error}"))?
+            } else {
+                output.fastq
+            };
             Ok(DirectCompressedOutput {
                 key: output.key,
                 member,
                 records: output.records,
                 bases: output.bases,
+                fragments: output.fragments,
                 uncompressed_len,
             })
         })
@@ -3641,6 +3931,7 @@ fn direct_writer_loop(
                             output.key,
                             output.records,
                             output.bases,
+                            output.fragments,
                             &mut sample_qc,
                             &mut unassigned_records,
                         )?;
@@ -3743,12 +4034,17 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
         items,
         fastq_backings,
         permit,
+        duplicates,
     } = batch;
     let mut buffers = BatchBuffers::new(state.output_layout)?;
     let mut referenced_outputs = Vec::with_capacity(items.len().saturating_mul(2));
     let mut counts = DemuxCounts::default();
 
-    for item in items {
+    for (item_index, item) in items.into_iter().enumerate() {
+        counts.preprocessing.set_duplicate(
+            duplicates.get(item_index).copied().unwrap_or(false),
+            state.preprocessing.options.fastp.dedup,
+        );
         match item {
             WorkItem::Single(record) => {
                 process_single_record(record, state, &mut buffers, &mut counts)?;
@@ -3776,8 +4072,18 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
             }
             WorkItem::BatchSingle(record) => {
                 let view = resolve_batch_record(&fastq_backings, record)?;
-                let (target, bounds) = route_single_parts(view.seq, state, &mut counts)?;
-                if should_emit(target, state.write_unassigned) {
+                if state.preprocessing.options.fastp.needs_owned() {
+                    process_single_record(
+                        OwnedFastqRecord::new(view.id, view.seq, view.qual),
+                        state,
+                        &mut buffers,
+                        &mut counts,
+                    )?;
+                    continue;
+                }
+                let (target, bounds) =
+                    route_single_parts(view.seq, view.qual, state, &mut counts, true)?;
+                if let Some(target) = emitted_target(target, state.write_unassigned) {
                     referenced_outputs.push(ReferencedOutput {
                         key: OutputKey {
                             target,
@@ -3791,9 +4097,26 @@ fn process_batch(batch: WorkBatch, state: &SharedState) -> Result<ProcessedBatch
             WorkItem::BatchPair { r1, r2 } => {
                 let r1_view = resolve_batch_record(&fastq_backings, r1)?;
                 let r2_view = resolve_batch_record(&fastq_backings, r2)?;
-                let (target, r1_bounds, r2_bounds) =
-                    route_pair_parts(r1_view.seq, r2_view.seq, state, &mut counts)?;
-                if should_emit(target, state.write_unassigned) {
+                if state.preprocessing.options.fastp.needs_owned() {
+                    process_pair(
+                        OwnedFastqRecord::new(r1_view.id, r1_view.seq, r1_view.qual),
+                        OwnedFastqRecord::new(r2_view.id, r2_view.seq, r2_view.qual),
+                        state,
+                        &mut buffers,
+                        &mut counts,
+                    )?;
+                    continue;
+                }
+                let (target, r1_bounds, r2_bounds) = route_pair_parts(
+                    r1_view.seq,
+                    r1_view.qual,
+                    r2_view.seq,
+                    r2_view.qual,
+                    state,
+                    &mut counts,
+                    true,
+                )?;
+                if let Some(target) = emitted_target(target, state.write_unassigned) {
                     referenced_outputs.push(ReferencedOutput {
                         key: OutputKey {
                             target,
@@ -3862,35 +4185,245 @@ fn resolve_batch_record(
         .record(record.record)
 }
 
+fn aux_record(
+    buffers: &mut BatchBuffers,
+    stream: AuxiliaryStream,
+    record: &OwnedFastqRecord,
+    bounds: BiologicalBounds,
+) -> Result<(), String> {
+    buffers.push_record(
+        OutputTarget::Auxiliary { stream },
+        OutputMate::Single,
+        record,
+        bounds,
+    )
+}
 fn process_single_record(
-    record: OwnedFastqRecord,
+    mut record: OwnedFastqRecord,
     state: &SharedState,
     buffers: &mut BatchBuffers,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let (target, bounds) = route_single_record(&record, state, counts)?;
-
-    if should_emit(target, state.write_unassigned) {
-        buffers.push_record(target, OutputMate::Single, &record, bounds)?;
+    let o = &state.preprocessing.options.fastp;
+    if !o.needs_owned() {
+        let (target, bounds) = route_single_record(&record, state, counts)?;
+        if let Some(target) = emitted_target(target, state.write_unassigned) {
+            buffers.push_record(target, OutputMate::Single, &record, bounds)?;
+        }
+        return Ok(());
     }
-
+    let (target, bounds) = route_single_parts(&record.seq, &record.qual, state, counts, false)?;
+    let assigned = matches!(target, Some(OutputTarget::Sample { .. }));
+    state
+        .preprocessing
+        .check_indexes([&record.id, &[]], false, &mut counts.preprocessing)?;
+    if o.umi || o.fix_mgi_id {
+        record.id = crate::fastp_runtime::header(
+            o,
+            &record.id,
+            [&record.id, &[]],
+            [&record.seq, &[]],
+            [state.r1_prefix, 0],
+            false,
+        )?;
+    }
+    let retained = state.preprocessing.retain(
+        &[(&record.seq, &record.qual, bounds)],
+        assigned,
+        &mut counts.preprocessing,
+    )?;
+    if retained {
+        if let Some(target) = emitted_target(target, state.write_unassigned) {
+            buffers.push_record(target, OutputMate::Single, &record, bounds)?;
+            if o.stdout {
+                aux_record(buffers, AuxiliaryStream::Stdout, &record, bounds)?;
+            }
+        }
+    } else if o.failed_out.is_some() {
+        aux_record(buffers, AuxiliaryStream::Failed, &record, bounds)?;
+    }
     Ok(())
 }
-
 fn process_pair(
-    r1: OwnedFastqRecord,
-    r2: OwnedFastqRecord,
+    mut r1: OwnedFastqRecord,
+    mut r2: OwnedFastqRecord,
     state: &SharedState,
     buffers: &mut BatchBuffers,
     counts: &mut DemuxCounts,
 ) -> Result<(), String> {
-    let (target, r1_bounds, r2_bounds) = route_pair_records(&r1, &r2, state, counts)?;
-
-    if should_emit(target, state.write_unassigned) {
-        buffers.push_record(target, OutputMate::R1, &r1, r1_bounds)?;
-        buffers.push_record(target, OutputMate::R2, &r2, r2_bounds)?;
+    let o = &state.preprocessing.options.fastp;
+    if !o.needs_owned() {
+        let (target, a, b) = route_pair_records(&r1, &r2, state, counts)?;
+        if let Some(target) = emitted_target(target, state.write_unassigned) {
+            buffers.push_record(target, OutputMate::R1, &r1, a)?;
+            buffers.push_record(target, OutputMate::R2, &r2, b)?;
+        }
+        return Ok(());
     }
-
+    let (target, a, b) =
+        route_pair_parts(&r1.seq, &r1.qual, &r2.seq, &r2.qual, state, counts, false)?;
+    let assigned = matches!(target, Some(OutputTarget::Sample { .. }));
+    let bounds = [a, b];
+    state
+        .preprocessing
+        .check_indexes([&r1.id, &r2.id], true, &mut counts.preprocessing)?;
+    if o.umi || o.fix_mgi_id {
+        let h1 = crate::fastp_runtime::header(
+            o,
+            &r1.id,
+            [&r1.id, &r2.id],
+            [&r1.seq, &r2.seq],
+            [state.r1_prefix, state.r2_prefix],
+            true,
+        )?;
+        let h2 = crate::fastp_runtime::header(
+            o,
+            &r2.id,
+            [&r1.id, &r2.id],
+            [&r1.seq, &r2.seq],
+            [state.r1_prefix, state.r2_prefix],
+            true,
+        )?;
+        r1.id = h1;
+        r2.id = h2;
+    }
+    let overlap = if o.merge || o.correction || o.overlapped_out.is_some() {
+        state
+            .preprocessing
+            .feature_overlap([&r1.seq, &r2.seq], bounds, &mut counts.preprocessing)
+    } else {
+        crate::overlap::OverlapResult::None
+    };
+    if let crate::overlap::OverlapResult::Unique(overlap) = overlap {
+        if o.correction {
+            counts.preprocessing.corrected_bases +=
+                crate::read_ops::correct(&mut r1, &mut r2, bounds, overlap);
+        }
+        if o.merge && assigned {
+            let fronts = [
+                a.start.saturating_sub(
+                    state
+                        .r1_prefix
+                        .saturating_add(crate::fastp_runtime::umi_bases(o, 0)),
+                ),
+                b.start.saturating_sub(
+                    state
+                        .r2_prefix
+                        .saturating_add(crate::fastp_runtime::umi_bases(o, 1)),
+                ),
+            ];
+            let merged = crate::read_ops::merge(&r1, &r2, bounds, overlap, fronts);
+            let mb = BiologicalBounds::full(merged.seq.len());
+            counts.preprocessing.mark_merged();
+            if state.preprocessing.retain(
+                &[(&merged.seq, &merged.qual, mb)],
+                true,
+                &mut counts.preprocessing,
+            )? {
+                let Some(OutputTarget::Sample { sample_id }) = target else {
+                    unreachable!()
+                };
+                buffers.push_record(
+                    OutputTarget::Merged { sample_id },
+                    OutputMate::Single,
+                    &merged,
+                    mb,
+                )?;
+                counts.preprocessing.merged_fragments += 1;
+                if overlap.mismatches == 0 && o.overlapped_out.is_some() {
+                    let start = overlap.insert_length.saturating_sub(b.len());
+                    aux_record(
+                        buffers,
+                        AuxiliaryStream::Overlap,
+                        &r1,
+                        BiologicalBounds {
+                            start: a.start + start,
+                            end: a.start + start + overlap.length,
+                        },
+                    )?;
+                }
+                if o.stdout {
+                    aux_record(buffers, AuxiliaryStream::Stdout, &merged, mb)?;
+                }
+            } else if o.failed_out.is_some() {
+                aux_record(buffers, AuxiliaryStream::Failed, &merged, mb)?;
+            }
+            return Ok(());
+        }
+    }
+    let retained = state.preprocessing.retain(
+        &[(&r1.seq, &r1.qual, a), (&r2.seq, &r2.qual, b)],
+        assigned,
+        &mut counts.preprocessing,
+    )?;
+    if retained {
+        if let Some(target) = emitted_target(target, state.write_unassigned) {
+            if o.merge && o.include_unmerged {
+                if let OutputTarget::Sample { sample_id } = target {
+                    buffers.push_weighted(
+                        OutputTarget::Merged { sample_id },
+                        OutputMate::Single,
+                        &r1,
+                        a,
+                        1,
+                    )?;
+                    buffers.push_weighted(
+                        OutputTarget::Merged { sample_id },
+                        OutputMate::Single,
+                        &r2,
+                        b,
+                        0,
+                    )?;
+                } else {
+                    buffers.push_record(target, OutputMate::R1, &r1, a)?;
+                    buffers.push_record(target, OutputMate::R2, &r2, b)?;
+                }
+            } else {
+                buffers.push_record(target, OutputMate::R1, &r1, a)?;
+                buffers.push_record(target, OutputMate::R2, &r2, b)?;
+            }
+            if o.stdout {
+                aux_record(buffers, AuxiliaryStream::Stdout, &r1, a)?;
+                aux_record(buffers, AuxiliaryStream::Stdout, &r2, b)?;
+            }
+            if let crate::overlap::OverlapResult::Unique(overlap) = overlap
+                && overlap.mismatches == 0
+                && o.overlapped_out.is_some()
+            {
+                let start = overlap.insert_length.saturating_sub(b.len());
+                aux_record(
+                    buffers,
+                    AuxiliaryStream::Overlap,
+                    &r1,
+                    BiologicalBounds {
+                        start: a.start + start,
+                        end: a.start + start + overlap.length,
+                    },
+                )?;
+            }
+        }
+    } else {
+        let failed = counts.preprocessing.failed_mates();
+        for (mate, record, bounds) in [(0, &r1, a), (1, &r2, b)] {
+            if failed[mate] && o.failed_out.is_some() {
+                aux_record(buffers, AuxiliaryStream::Failed, record, bounds)?;
+            }
+            if !failed[mate] {
+                let stream = if mate == 0 {
+                    AuxiliaryStream::Unpaired1
+                } else if o.unpaired2.is_some() {
+                    AuxiliaryStream::Unpaired2
+                } else {
+                    AuxiliaryStream::Unpaired1
+                };
+                if (mate == 0 && o.unpaired1.is_some())
+                    || (mate == 1 && (o.unpaired2.is_some() || o.unpaired1.is_some()))
+                {
+                    aux_record(buffers, stream, record, bounds)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3898,27 +4431,50 @@ fn route_single_record(
     record: &OwnedFastqRecord,
     state: &SharedState,
     counts: &mut DemuxCounts,
-) -> Result<(OutputTarget, BiologicalBounds), String> {
-    route_single_parts(&record.seq, state, counts)
+) -> Result<(Option<OutputTarget>, BiologicalBounds), String> {
+    route_single_parts(&record.seq, &record.qual, state, counts, true)
 }
 
 fn route_single_parts(
     seq: &[u8],
+    qual: &[u8],
     state: &SharedState,
     counts: &mut DemuxCounts,
-) -> Result<(OutputTarget, BiologicalBounds), String> {
-    let route = if let Some(route) = state.routing.route_read(seq, None)? {
+    filter_now: bool,
+) -> Result<(Option<OutputTarget>, BiologicalBounds), String> {
+    let route = if let Some(route) = state.routing.as_ref().map_or(
+        Ok(Some(RouteResult::Assigned { sample_id: 0 })),
+        |routing| routing.route_read(seq, None),
+    )? {
         route
     } else {
         counts.short_reads += 1;
         RouteResult::Unmatched
     };
     let bounds = if let RouteResult::Assigned { sample_id } = route {
-        counts.biological_bounds(&state.routing, sample_id, 0, seq, state.r1_prefix)
+        state.preprocessing.bounds(
+            sample_id,
+            0,
+            seq,
+            qual,
+            state.r1_prefix,
+            &mut counts.preprocessing,
+        )
     } else {
         BiologicalBounds::full(seq.len())
     };
-    Ok((route_to_target(route, counts), bounds))
+    let target = route_to_target(route, counts);
+    let retain = if filter_now {
+        state.preprocessing.retain(
+            &[(seq, qual, bounds)],
+            matches!(route, RouteResult::Assigned { .. }),
+            &mut counts.preprocessing,
+        )?
+    } else {
+        true
+    };
+    counts.sync_adapter_counts();
+    Ok((retain.then_some(target), bounds))
 }
 
 fn route_pair_records(
@@ -3926,27 +4482,37 @@ fn route_pair_records(
     r2: &OwnedFastqRecord,
     state: &SharedState,
     counts: &mut DemuxCounts,
-) -> Result<(OutputTarget, BiologicalBounds, BiologicalBounds), String> {
-    route_pair_parts(&r1.seq, &r2.seq, state, counts)
+) -> Result<(Option<OutputTarget>, BiologicalBounds, BiologicalBounds), String> {
+    route_pair_parts(&r1.seq, &r1.qual, &r2.seq, &r2.qual, state, counts, true)
 }
 
 fn route_pair_parts(
     r1_seq: &[u8],
+    r1_qual: &[u8],
     r2_seq: &[u8],
+    r2_qual: &[u8],
     state: &SharedState,
     counts: &mut DemuxCounts,
-) -> Result<(OutputTarget, BiologicalBounds, BiologicalBounds), String> {
-    let route = if let Some(route) = state.routing.route_read(r1_seq, Some(r2_seq))? {
+    filter_now: bool,
+) -> Result<(Option<OutputTarget>, BiologicalBounds, BiologicalBounds), String> {
+    let route = if let Some(route) = state.routing.as_ref().map_or(
+        Ok(Some(RouteResult::Assigned { sample_id: 0 })),
+        |routing| routing.route_read(r1_seq, Some(r2_seq)),
+    )? {
         route
     } else {
         counts.short_reads += 1;
         RouteResult::Unmatched
     };
     let (r1_bounds, r2_bounds) = if let RouteResult::Assigned { sample_id } = route {
-        (
-            counts.biological_bounds(&state.routing, sample_id, 0, r1_seq, state.r1_prefix),
-            counts.biological_bounds(&state.routing, sample_id, 1, r2_seq, state.r2_prefix),
-        )
+        let [r1, r2] = state.preprocessing.pair_bounds(
+            sample_id,
+            [r1_seq, r2_seq],
+            [r1_qual, r2_qual],
+            [state.r1_prefix, state.r2_prefix],
+            &mut counts.preprocessing,
+        );
+        (r1, r2)
     } else {
         (
             BiologicalBounds::full(r1_seq.len()),
@@ -3954,11 +4520,21 @@ fn route_pair_parts(
         )
     };
     let target = route_to_target(route, counts);
-    Ok((target, r1_bounds, r2_bounds))
+    let retain = if filter_now {
+        state.preprocessing.retain(
+            &[(r1_seq, r1_qual, r1_bounds), (r2_seq, r2_qual, r2_bounds)],
+            matches!(route, RouteResult::Assigned { .. }),
+            &mut counts.preprocessing,
+        )?
+    } else {
+        true
+    };
+    counts.sync_adapter_counts();
+    Ok((retain.then_some(target), r1_bounds, r2_bounds))
 }
 
-fn should_emit(target: OutputTarget, write_unassigned: bool) -> bool {
-    matches!(target, OutputTarget::Sample { .. }) || write_unassigned
+fn emitted_target(target: Option<OutputTarget>, write_unassigned: bool) -> Option<OutputTarget> {
+    target.filter(|target| matches!(target, OutputTarget::Sample { .. }) || write_unassigned)
 }
 
 fn route_to_target(route: RouteResult, counts: &mut DemuxCounts) -> OutputTarget {
@@ -4145,6 +4721,7 @@ fn ordered_coordinator_loop(
                     output.key,
                     output.records,
                     output.bases,
+                    output.fragments,
                     &mut sample_qc,
                     &mut unassigned_records,
                 )?;
@@ -4166,6 +4743,7 @@ fn ordered_coordinator_loop(
                     output.key,
                     1,
                     u64::try_from(seq.len()).map_err(|_| "Read length overflow")?,
+                    u64::from(output.key.mate != OutputMate::R2),
                     &mut sample_qc,
                     &mut unassigned_records,
                 )?;
@@ -4559,6 +5137,7 @@ fn aggregate_processed_batch(
             output.key,
             output.records,
             output.bases,
+            output.fragments,
             sample_qc,
             unassigned_records,
         )?;
@@ -4618,6 +5197,7 @@ fn aggregate_processed_batch(
             output.key,
             1,
             u64::try_from(seq.len()).map_err(|_| "Read length overflow")?,
+            u64::from(output.key.mate != OutputMate::R2),
             sample_qc,
             unassigned_records,
         )?;
@@ -4818,14 +5398,20 @@ fn compress_job(
     permit: PermitGuard,
 ) -> Result<CompressedChunk, String> {
     let uncompressed_len = job.fastq_bytes.len();
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(compression_level));
-    encoder
-        .write_all(&job.fastq_bytes)
-        .map_err(|error| format!("Could not compress FASTQ chunk: {error}"))?;
-    let member = encoder
-        .finish()
-        .map_err(|error| format!("Could not finish FASTQ gzip member: {error}"))?;
+    let member = if job.gzip {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(compression_level));
+        encoder
+            .write_all(&job.fastq_bytes)
+            .map_err(|error| format!("Could not compress FASTQ chunk: {error}"))?;
+
+        encoder
+            .finish()
+            .map_err(|error| format!("Could not finish FASTQ gzip member: {error}"))?
+    } else {
+        job.fastq_bytes
+    };
     Ok(CompressedChunk {
+        part: job.part,
         key: job.key,
         chunk_id: job.chunk_id,
         member,
@@ -4959,7 +5545,7 @@ fn append_compressed_chunk(
     chunk: &CompressedChunk,
 ) -> Result<(), String> {
     debug_assert!(chunk.uncompressed_len > 0);
-    append_member(writer, chunk.key, &chunk.member)
+    writer.append_part(chunk.key, chunk.part, &chunk.member)
 }
 
 fn append_member(
@@ -4968,6 +5554,12 @@ fn append_member(
     member: &[u8],
 ) -> Result<(), String> {
     match key.target {
+        OutputTarget::Merged { sample_id } => {
+            writer.append_extra_member(OutputTarget::Merged { sample_id }, member)
+        }
+        OutputTarget::Auxiliary { stream } => {
+            writer.append_extra_member(OutputTarget::Auxiliary { stream }, member)
+        }
         OutputTarget::Sample { sample_id } => {
             writer.append_sample_member(sample_id, key.mate, member)
         }
@@ -4979,10 +5571,15 @@ fn observe_output_metrics(
     key: OutputKey,
     records: u64,
     bases: u64,
+    fragments: u64,
     sample_qc: &mut SampleQc,
     unassigned_records: &mut u64,
 ) -> Result<(), String> {
     match key.target {
+        OutputTarget::Merged { sample_id } => {
+            sample_qc.observe_merged(sample_id, records, bases, fragments)
+        }
+        OutputTarget::Auxiliary { .. } => Ok(()),
         OutputTarget::Sample { sample_id } => {
             sample_qc.observe_output(sample_id, key.mate, records, bases)
         }
@@ -5011,6 +5608,8 @@ fn verify_unassigned_output_counts(
         .checked_add(counts.ambiguous)
         .and_then(|value| value.checked_add(counts.unrouted))
         .ok_or("Unassigned count overflow")?;
+    let classified =
+        classified - (counts.preprocessing.rejected - counts.preprocessing.assigned_rejected);
     let expected = if paired {
         classified
             .checked_mul(2)
@@ -5120,9 +5719,13 @@ fn produce_single(
     control: &PipelineControl,
 ) -> Result<(), String> {
     let mut reader = parallel_input.open(path)?;
+    let mut quality_scratch = Vec::new();
 
     loop {
         control.check()?;
+        if batcher.limit_reached() {
+            break;
+        }
         let Some(record) = reader.next_record() else {
             break;
         };
@@ -5137,6 +5740,11 @@ fn produce_single(
             )
         })?;
 
+        let qual = crate::fastp_runtime::normalize_quality(
+            qual,
+            parallel_input.phred64,
+            &mut quality_scratch,
+        )?;
         if let Some(stats) = stats.as_mut() {
             stats.update(seq, qual)?;
         }
@@ -5172,9 +5780,15 @@ fn stream_fastq_blocks(
     control: &PipelineControl,
 ) -> Result<(), String> {
     let mut reader = parallel_input.open(path)?;
+    let mut quality_scratch = Vec::new();
     let mut builder = FastqReadBlockBuilder::new()?;
+    let mut read_count = 0u64;
     loop {
         control.check()?;
+        if parallel_input.read_limit > 0 && read_count >= parallel_input.read_limit {
+            break;
+        }
+        read_count += 1;
         let Some(record) = reader.next_record() else {
             break;
         };
@@ -5185,6 +5799,11 @@ fn stream_fastq_blocks(
         let qual = record
             .qual()
             .ok_or_else(|| format!("Input '{}' has no FASTQ quality scores", path.display()))?;
+        let qual = crate::fastp_runtime::normalize_quality(
+            qual,
+            parallel_input.phred64,
+            &mut quality_scratch,
+        )?;
         builder.push(record.id(), seq, qual)?;
         if builder.is_full() {
             send_fastq_block(sender, builder, control)?;
@@ -5277,9 +5896,15 @@ fn produce_batch_owned_single(
     control: &PipelineControl,
 ) -> Result<(), String> {
     let mut reader = parallel_input.open(path)?;
+    let mut quality_scratch = Vec::new();
     let mut builder = FastqReadBlockBuilder::new()?;
     loop {
         control.check()?;
+        if batcher.read_limit > 0
+            && batcher.processed_fragments + builder.records.len() as u64 >= batcher.read_limit
+        {
+            break;
+        }
         let Some(record) = reader.next_record() else {
             break;
         };
@@ -5293,6 +5918,11 @@ fn produce_batch_owned_single(
                 path.display()
             )
         })?;
+        let qual = crate::fastp_runtime::normalize_quality(
+            qual,
+            parallel_input.phred64,
+            &mut quality_scratch,
+        )?;
         if let Some(stats) = stats.as_deref_mut() {
             stats.update(seq, qual)?;
         }
@@ -5327,9 +5957,15 @@ fn stream_owned_records(
     control: &PipelineControl,
 ) -> Result<(), String> {
     let mut reader = parallel_input.open(path)?;
+    let mut quality_scratch = Vec::new();
 
+    let mut read_count = 0u64;
     loop {
         control.check()?;
+        if parallel_input.read_limit > 0 && read_count >= parallel_input.read_limit {
+            break;
+        }
+        read_count += 1;
         let Some(record) = reader.next_record() else {
             break;
         };
@@ -5342,6 +5978,11 @@ fn stream_owned_records(
             .qual()
             .ok_or_else(|| format!("Input '{}' has no FASTQ quality scores", path.display()))?;
 
+        let qual = crate::fastp_runtime::normalize_quality(
+            qual,
+            parallel_input.phred64,
+            &mut quality_scratch,
+        )?;
         let owned = OwnedFastqRecord::new(record.id(), seq, qual);
         send_or_cancel(
             sender,
@@ -5564,6 +6205,9 @@ fn produce_paired_from_receivers(
     control: &PipelineControl,
 ) -> Result<(), String> {
     loop {
+        if batcher.limit_reached() {
+            return Ok(());
+        }
         let r1_next = recv_owned_record(r1_receiver, r1_stats.as_deref_mut(), control)?;
         let r2_next = recv_owned_record(r2_receiver, r2_stats.as_deref_mut(), control)?;
 
@@ -5865,6 +6509,9 @@ fn produce_batch_owned_paired_from_streams(
     control: &PipelineControl,
 ) -> Result<(), String> {
     loop {
+        if batcher.limit_reached() {
+            return Ok(());
+        }
         let have_r1 = r1_stream.ensure_record(control)?;
         let have_r2 = r2_stream.ensure_record(control)?;
         match (have_r1, have_r2) {
@@ -6155,6 +6802,8 @@ mod tests {
     fn chunk(sample_id: u32, chunk_id: u64, text: &str) -> CompressedChunk {
         compress_job(
             CompressionJob {
+                part: 0,
+                gzip: true,
                 key: OutputKey {
                     target: OutputTarget::Sample { sample_id },
                     mate: OutputMate::Single,
@@ -6607,6 +7256,7 @@ mod tests {
             output_buffer_memory: ByteSizeSetting::Bytes(4 * 1024 * 1024),
             max_open_files: Some(2),
             max_mismatches: 0,
+            preprocessing: Default::default(),
             no_pass_through: false,
             pass_through_mismatches: 1,
             r1_distal_structure: None,
@@ -6729,4 +7379,51 @@ mod tests {
             }
         }
     }
+}
+
+fn produce_interleaved(
+    path: &Path,
+    batcher: &mut BatchSender,
+    mut r1_stats: Option<&mut MateQcStats>,
+    mut r2_stats: Option<&mut MateQcStats>,
+    parallel_input: &ParallelInput,
+    control: &PipelineControl,
+) -> Result<(), String> {
+    let mut reader = parallel_input.open(path)?;
+    let mut quality = Vec::new();
+    loop {
+        control.check()?;
+        if batcher.limit_reached() {
+            break;
+        }
+        let Some(first) = reader.next_record() else {
+            break;
+        };
+        let first = first.map_err(|e| format!("Interleaved FASTQ parse error: {e}"))?;
+        let seq = first.seq();
+        let qual = first.qual().ok_or("Interleaved input must be FASTQ")?;
+        let qual =
+            crate::fastp_runtime::normalize_quality(qual, parallel_input.phred64, &mut quality)?;
+        let r1 = OwnedFastqRecord::new(first.id(), seq.as_ref(), qual);
+        let second = reader
+            .next_record()
+            .ok_or("Interleaved FASTQ ends with an orphan R1 record")?
+            .map_err(|e| format!("Interleaved FASTQ parse error: {e}"))?;
+        let seq = second.seq();
+        let qual = second.qual().ok_or("Interleaved input must be FASTQ")?;
+        let qual =
+            crate::fastp_runtime::normalize_quality(qual, parallel_input.phred64, &mut quality)?;
+        let r2 = OwnedFastqRecord::new(second.id(), seq.as_ref(), qual);
+        if core_read_id(&r1.id) != core_read_id(&r2.id) {
+            return Err("Interleaved FASTQ mate names do not match".into());
+        }
+        if let Some(stats) = r1_stats.as_mut() {
+            stats.update(&r1.seq, &r1.qual)?;
+        }
+        if let Some(stats) = r2_stats.as_mut() {
+            stats.update(&r2.seq, &r2.qual)?;
+        }
+        batcher.push(WorkItem::Pair { r1, r2 })?;
+    }
+    Ok(())
 }

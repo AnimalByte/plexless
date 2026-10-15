@@ -7,6 +7,8 @@ use crate::input::is_gzip_file;
 
 #[derive(Clone)]
 pub(crate) struct ParallelInput {
+    pub(crate) phred64: bool,
+    pub(crate) read_limit: u64,
     decoder: Option<Decoder>,
     pool: Option<DecoderPool>,
     requested_workers: usize,
@@ -20,6 +22,8 @@ impl ParallelInput {
     ) -> Result<Self, String> {
         if !parallel_gzip {
             return Ok(Self {
+                phred64: false,
+                read_limit: 0,
                 decoder: None,
                 pool: None,
                 requested_workers: 1,
@@ -50,6 +54,8 @@ impl ParallelInput {
             .map_err(|e| format!("Could not configure parallel gzip decoder: {e}"))?;
 
         Ok(Self {
+            phred64: false,
+            read_limit: 0,
             decoder: Some(decoder),
             pool: Some(pool),
             requested_workers: max_input_threads,

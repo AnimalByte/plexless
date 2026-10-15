@@ -288,3 +288,31 @@ fn unused_root_barcode_is_unrouted() {
 
     assert_eq!(route(&tree, "CCCCGGGG"), RouteResult::Unrouted);
 }
+
+#[test]
+fn higher_mismatch_budget_keeps_route_local_namespaces_and_strict_safety() {
+    let test = TestDir::new("high-budget-parent-local");
+    let catalog = "Set\tID\tSequence\nA\tA1\tAAAAAAAAAA\nA\tA2\tCCCCCCCCCC\nB\tB1\tAAAAAAAAAA\nB\tB2\tAAAAAAAATT\n";
+    let tree = compile_tree(
+        &test,
+        "R1_10A10B",
+        catalog,
+        "Sample\tA\tB\ns1\tA1\tB1\ns2\tA2\tB2\n",
+        3,
+    )
+    .unwrap();
+    assert_eq!(
+        route(&tree, "CCCCCCCAAACCCAAAAATT"),
+        RouteResult::Assigned { sample_id: 1 }
+    );
+    let error = compile_tree(
+        &test,
+        "R1_10A10B",
+        catalog,
+        "Sample\tA\tB\ns1\tA1\tB1\ns2\tA1\tB2\n",
+        3,
+    )
+    .unwrap_err();
+    assert!(error.contains("minimum Hamming distance 7"), "{error}");
+    assert!(error.contains("path A=A1"), "{error}");
+}

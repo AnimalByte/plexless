@@ -31,6 +31,7 @@ pub struct Decoder {
     corrected: HashMap<u64, CorrectionTarget>,
     length: u8,
     max_mismatches: u8,
+    indexed: bool,
 }
 
 struct NeighborBuilder<'a> {
@@ -68,9 +69,6 @@ impl Decoder {
                 "Barcode candidate set {} is empty under {parent_path}",
                 set.symbol as char
             ));
-        }
-        if max_mismatches > 2 {
-            return Err("Maximum mismatches greater than 2 are not supported".into());
         }
 
         let mut barcodes = Vec::with_capacity(candidate_ids.len());
@@ -122,8 +120,15 @@ impl Decoder {
 
         validate_barcode_distance(&barcodes, &names, set.symbol, max_mismatches, parent_path)?;
 
-        let corrected = build_correction_index(&barcodes, &exact, length, max_mismatches)
-            .map_err(|error| format!("{error} under {parent_path}"))?;
+        let indexed = correction_index_size(length, max_mismatches).saturating_mul(barcodes.len())
+            <= 1_000_000;
+        let corrected = build_correction_index(
+            &barcodes,
+            &exact,
+            length,
+            if indexed { max_mismatches } else { 0 },
+        )
+        .map_err(|error| format!("{error} under {parent_path}"))?;
 
         Ok(Self {
             barcodes,
@@ -131,6 +136,7 @@ impl Decoder {
             corrected,
             length,
             max_mismatches,
+            indexed,
         })
     }
 
@@ -150,7 +156,11 @@ impl Decoder {
                 mismatches: target.mismatches,
             };
         }
-        DecodeResult::Unmatched
+        if self.indexed {
+            DecodeResult::Unmatched
+        } else {
+            self.decode_with_n(observed)
+        }
     }
 
     fn decode_with_n(&self, observed: EncodedBarcode) -> DecodeResult {
@@ -272,6 +282,24 @@ fn validate_barcode_distance(
     Ok(())
 }
 
+// Bound neighborhood construction before allocating. Above this cap, decode by
+// packed distance over route-local candidates, with O(catalog) memory.
+fn correction_index_size(length: u8, budget: u8) -> usize {
+    let mut term = 1usize;
+    let mut total = 0usize;
+    for distance in 1..=usize::from(budget) {
+        term = term
+            .saturating_mul(usize::from(length) + 1 - distance)
+            .saturating_mul(3)
+            / distance;
+        total = total.saturating_add(term);
+        if total > 1_000_000 {
+            return total;
+        }
+    }
+    total
+}
+
 fn build_correction_index(
     barcodes: &[EncodedBarcode],
     exact: &HashMap<u64, u32>,
@@ -329,7 +357,7 @@ mod tests {
     /// Production constructors reject this deliberately unsafe two-barcode
     /// geometry. Building it directly here exercises the conservative runtime
     /// ambiguity branch as a defense-in-depth behavior.
-    fn unsafe_n_test_decoder() -> Decoder {
+    pub(super) fn unsafe_n_test_decoder() -> Decoder {
         let barcodes = vec![encode(b"AAAA").unwrap(), encode(b"AAAT").unwrap()];
         let exact = HashMap::from([(barcodes[0].value, 0), (barcodes[1].value, 1)]);
         Decoder {
@@ -338,6 +366,7 @@ mod tests {
             corrected: HashMap::new(),
             length: 4,
             max_mismatches: 1,
+            indexed: true,
         }
     }
 
@@ -363,6 +392,90 @@ mod tests {
         assert_eq!(
             decoder.decode(encode(b"AANN").unwrap()),
             DecodeResult::Unmatched
+        );
+    }
+}
+
+#[cfg(test)]
+mod scaling_tests {
+    use super::*;
+    use crate::barcodes::BarcodeCatalog;
+    use crate::structure::ReadLayout;
+
+    fn catalog() -> BarcodeCatalog {
+        let path = std::env::temp_dir().join(format!(
+            "plexless-decoder-scaling-{}.tsv",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "Set\tID\tSequence\nA\ta\tACGTTGCACTGATCGAGGTACCTATGCCAGTA\n",
+        )
+        .unwrap();
+        let result =
+            BarcodeCatalog::load(&path, &ReadLayout::single(Some("R1_32A")).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+    #[test]
+    fn large_budgets_use_bounded_fallback_and_n_aware_distance() {
+        let catalog = catalog();
+        let set = catalog.set(b'A').unwrap();
+        for budget in [0, 1, 2, 3, 4, 8, 16, 32] {
+            let decoder = Decoder::new(set, budget).unwrap();
+            assert!(decoder.corrected.len() <= 1_000_000);
+            if budget >= 4 {
+                assert!(!decoder.indexed);
+                assert!(decoder.corrected.is_empty());
+            }
+            let mut observed = set.barcodes[0].sequence.as_bytes().to_vec();
+            assert_eq!(
+                decoder.decode(encode(&observed).unwrap()),
+                DecodeResult::Exact { barcode_id: 0 }
+            );
+            for (i, base) in observed.iter_mut().enumerate().take(usize::from(budget)) {
+                *base = if i % 2 == 0 {
+                    b'N'
+                } else if *base == b'A' {
+                    b'C'
+                } else {
+                    b'A'
+                };
+            }
+            if budget > 0 {
+                assert_eq!(
+                    decoder.decode(encode(&observed).unwrap()),
+                    DecodeResult::Corrected {
+                        barcode_id: 0,
+                        mismatches: budget
+                    }
+                );
+            }
+            if budget < 32 {
+                observed[usize::from(budget)] = b'N';
+                assert_eq!(
+                    decoder.decode(encode(&observed).unwrap()),
+                    DecodeResult::Unmatched
+                );
+            }
+        }
+        assert!(
+            Decoder::new(set, 33)
+                .unwrap_err()
+                .contains("barcode length")
+        );
+    }
+    #[test]
+    fn fallback_ambiguity_and_exact_precedence() {
+        let mut decoder = super::tests::unsafe_n_test_decoder();
+        decoder.indexed = false;
+        assert_eq!(
+            decoder.decode(encode(b"AAAC").unwrap()),
+            DecodeResult::Ambiguous
+        );
+        assert_eq!(
+            decoder.decode(encode(b"AAAA").unwrap()),
+            DecodeResult::Exact { barcode_id: 0 }
         );
     }
 }

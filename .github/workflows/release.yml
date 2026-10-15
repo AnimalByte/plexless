@@ -1,0 +1,74 @@
+name: Release binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config zlib1g-dev
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test optimized build
+        run: cargo test --locked --release --all-targets --all-features
+
+      - name: Build executable
+        run: cargo build --locked --release --bin plexless
+
+      - name: Package binary, documentation, licenses and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version=$(python3 -c 'import json, subprocess; print(json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))["packages"][0]["version"])')
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$package_version" ]]; then
+            echo "Tag does not match Cargo package version" >&2
+            exit 1
+          fi
+          archive_stem="plexless-v${package_version}-x86_64-unknown-linux-gnu"
+          stage_dir="$RUNNER_TEMP/$archive_stem"
+          mkdir -p "$stage_dir" dist
+          install -m 0755 target/release/plexless "$stage_dir/plexless"
+          strip --strip-unneeded "$stage_dir/plexless"
+          cp README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md "$stage_dir/"
+          cp -R docs licenses "$stage_dir/"
+          {
+            "$stage_dir/plexless" --version
+            printf 'Source commit: %s\nBuild runner: Ubuntu 22.04, Linux x86-64\n' "$GITHUB_SHA"
+            printf 'Runtime: glibc >= 2.35, libz.so.1\n'
+            rustc --version --verbose
+            ldd "$stage_dir/plexless"
+          } > "$stage_dir/BUILD_INFO.txt"
+          "$stage_dir/plexless" --help > /dev/null
+          "$stage_dir/plexless" demux --help > /dev/null
+          "$stage_dir/plexless" trim --help > /dev/null
+          cp "$stage_dir/plexless" dist/plexless
+          source_date_epoch=$(git log -1 --format=%ct)
+          tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP" -cf - "$archive_stem" | gzip -n > "dist/$archive_stem.tar.gz"
+          cd dist
+          sha256sum plexless "$archive_stem.tar.gz" > SHA256SUMS
+          sha256sum "$archive_stem.tar.gz" > "$archive_stem.tar.gz.sha256"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: plexless-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

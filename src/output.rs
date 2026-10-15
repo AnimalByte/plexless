@@ -79,7 +79,37 @@ pub enum OutputMate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub(crate) enum AuxiliaryStream {
+    Failed = 0,
+    Unpaired1 = 1,
+    Unpaired2 = 2,
+    Overlap = 3,
+    Stdout = 4,
+}
+impl AuxiliaryStream {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Failed,
+        Self::Unpaired1,
+        Self::Unpaired2,
+        Self::Overlap,
+        Self::Stdout,
+    ];
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Unpaired1 => "unpaired_R1",
+            Self::Unpaired2 => "unpaired_R2",
+            Self::Overlap => "overlapped",
+            Self::Stdout => "stdout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum OutputTarget {
+    Merged { sample_id: u32 },
+    Auxiliary { stream: AuxiliaryStream },
     Sample { sample_id: u32 },
     Unassigned,
 }
@@ -95,6 +125,13 @@ pub(crate) struct OutputLayout {
     sample_count: usize,
     paired: bool,
     write_unassigned: bool,
+    merged: bool,
+    auxiliary: u8,
+    plain_primary: u8,
+    plain_merged: bool,
+    plain_auxiliary: u8,
+    split_records: u64,
+    shared_unpaired: bool,
 }
 
 impl OutputLayout {
@@ -103,55 +140,162 @@ impl OutputLayout {
             sample_count,
             paired,
             write_unassigned,
+            merged: false,
+            auxiliary: 0,
+            plain_primary: 0,
+            plain_merged: false,
+            plain_auxiliary: 0,
+            split_records: 0,
+            shared_unpaired: false,
         }
     }
 
-    pub(crate) fn stream_count(self) -> Result<usize, String> {
-        let mates = if self.paired { 2 } else { 1 };
+    pub(crate) fn canonical_target(self, target: OutputTarget) -> OutputTarget {
+        if self.shared_unpaired
+            && target
+                == (OutputTarget::Auxiliary {
+                    stream: AuxiliaryStream::Unpaired2,
+                })
+        {
+            OutputTarget::Auxiliary {
+                stream: AuxiliaryStream::Unpaired1,
+            }
+        } else {
+            target
+        }
+    }
+    pub(crate) fn with_fastp(mut self, o: &crate::fastp_options::FastpOptions) -> Self {
+        let plain = |path: Option<&std::path::Path>| {
+            path.is_some_and(|p| {
+                p.extension()
+                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("gz"))
+            })
+        };
+        if plain(o.out1.as_deref()) {
+            self.plain_primary |= 1;
+        }
+        if plain(o.out2.as_deref()) {
+            self.plain_primary |= 2;
+        }
+        self.plain_merged = plain(o.merged_out.as_deref());
+        for (stream, path) in [
+            (AuxiliaryStream::Failed, o.failed_out.as_deref()),
+            (AuxiliaryStream::Unpaired1, o.unpaired1.as_deref()),
+            (AuxiliaryStream::Unpaired2, o.unpaired2.as_deref()),
+            (AuxiliaryStream::Overlap, o.overlapped_out.as_deref()),
+        ] {
+            if plain(path) {
+                self.plain_auxiliary |= 1 << stream as u8;
+            }
+        }
+        if o.stdout {
+            self.plain_auxiliary |= 1 << AuxiliaryStream::Stdout as u8;
+        }
+        self.shared_unpaired = o.unpaired1.is_some() && o.unpaired1 == o.unpaired2;
+        self.split_records = o.split_records;
+        self.merged = o.merge;
+        for (stream, enabled) in [
+            (AuxiliaryStream::Failed, o.failed_out.is_some()),
+            (AuxiliaryStream::Unpaired1, o.unpaired1.is_some()),
+            (AuxiliaryStream::Unpaired2, o.unpaired2.is_some()),
+            (AuxiliaryStream::Overlap, o.overlapped_out.is_some()),
+            (AuxiliaryStream::Stdout, o.stdout),
+        ] {
+            if enabled {
+                self.auxiliary |= 1 << stream as u8;
+            }
+        }
+        self
+    }
+    pub(crate) fn gzip(self, key: OutputKey) -> bool {
+        match key.target {
+            OutputTarget::Merged { .. } => !self.plain_merged,
+            OutputTarget::Auxiliary { stream } => self.plain_auxiliary & (1 << stream as u8) == 0,
+            OutputTarget::Sample { .. } => {
+                self.plain_primary & if key.mate == OutputMate::R2 { 2 } else { 1 } == 0
+            }
+            OutputTarget::Unassigned => true,
+        }
+    }
+    fn primary_count(self) -> Result<usize, String> {
         self.sample_count
             .checked_add(usize::from(self.write_unassigned))
-            .and_then(|targets| targets.checked_mul(mates))
-            .ok_or_else(|| "Output stream count overflow".to_string())
+            .and_then(|n| n.checked_mul(if self.paired { 2 } else { 1 }))
+            .ok_or_else(|| "Output stream count overflow".into())
     }
-
+    pub(crate) fn stream_count(self) -> Result<usize, String> {
+        self.primary_count()?
+            .checked_add(if self.merged { self.sample_count } else { 0 })
+            .and_then(|n| n.checked_add(self.auxiliary.count_ones() as usize))
+            .ok_or_else(|| "Output stream count overflow".into())
+    }
     pub(crate) fn stream_index(self, key: OutputKey) -> Result<usize, String> {
         let target = match key.target {
+            OutputTarget::Merged { sample_id } => {
+                if !self.merged
+                    || sample_id as usize >= self.sample_count
+                    || key.mate != OutputMate::Single
+                {
+                    return Err("Invalid merged output stream".into());
+                }
+                return Ok(self.primary_count()? + sample_id as usize);
+            }
+            OutputTarget::Auxiliary { stream } => {
+                let bit = 1u8 << stream as u8;
+                if self.auxiliary & bit == 0 || key.mate != OutputMate::Single {
+                    return Err("Auxiliary output is disabled or has invalid mate".into());
+                }
+                return Ok(self.primary_count()?
+                    + if self.merged { self.sample_count } else { 0 }
+                    + (self.auxiliary & (bit - 1)).count_ones() as usize);
+            }
             OutputTarget::Sample { sample_id } => {
-                let index = usize::try_from(sample_id).map_err(|_| "Invalid sample ID")?;
-                if index >= self.sample_count {
+                if sample_id as usize >= self.sample_count {
                     return Err(format!("Unknown sample ID {sample_id}"));
                 }
-                index
+                sample_id as usize
             }
             OutputTarget::Unassigned if self.write_unassigned => self.sample_count,
-            OutputTarget::Unassigned => {
-                return Err("Unassigned output is disabled".into());
-            }
+            OutputTarget::Unassigned => return Err("Unassigned output is disabled".into()),
         };
-
         if self.paired {
             let mate = match key.mate {
                 OutputMate::R1 => 0,
                 OutputMate::R2 => 1,
-                OutputMate::Single => {
-                    return Err("Paired-end output requires R1 or R2".into());
-                }
+                OutputMate::Single => return Err("Paired-end output requires R1 or R2".into()),
             };
-            target
-                .checked_mul(2)
-                .and_then(|value| value.checked_add(mate))
-                .ok_or_else(|| "Output stream index overflow".to_string())
-        } else {
-            if key.mate != OutputMate::Single {
-                return Err("Single-end output requires OutputMate::Single".into());
-            }
+            Ok(target * 2 + mate)
+        } else if key.mate == OutputMate::Single {
             Ok(target)
+        } else {
+            Err("Single-end output requires OutputMate::Single".into())
         }
     }
-
     pub(crate) fn key_at(self, index: usize) -> Result<OutputKey, String> {
         if index >= self.stream_count()? {
             return Err("Output stream index is out of range".into());
+        }
+        let primary = self.primary_count()?;
+        if index >= primary {
+            let index = index - primary;
+            if self.merged && index < self.sample_count {
+                return Ok(OutputKey {
+                    target: OutputTarget::Merged {
+                        sample_id: u32::try_from(index).map_err(|_| "Too many samples")?,
+                    },
+                    mate: OutputMate::Single,
+                });
+            }
+            let aux_index = index - if self.merged { self.sample_count } else { 0 };
+            let stream = AuxiliaryStream::ALL
+                .into_iter()
+                .filter(|s| self.auxiliary & (1 << *s as u8) != 0)
+                .nth(aux_index)
+                .ok_or("Invalid auxiliary stream")?;
+            return Ok(OutputKey {
+                target: OutputTarget::Auxiliary { stream },
+                mate: OutputMate::Single,
+            });
         }
         let (target_index, mate) = if self.paired {
             (
@@ -296,6 +440,8 @@ pub(crate) fn calculate_fastq_output_buffer_policy(
 
 #[derive(Debug)]
 pub(crate) struct CompressionJob {
+    pub(crate) part: u64,
+    pub(crate) gzip: bool,
     pub(crate) key: OutputKey,
     pub(crate) chunk_id: u64,
     pub(crate) fastq_bytes: Vec<u8>,
@@ -313,6 +459,8 @@ pub(crate) enum CompressionFlushReason {
 struct Accumulator {
     bytes: Vec<u8>,
     next_chunk_id: u64,
+    records: u64,
+    part: u64,
 }
 
 /// Persistent buffers are indexed by output identity and span input work
@@ -348,6 +496,60 @@ impl OutputAccumulator {
     }
 
     pub(crate) fn append(
+        &mut self,
+        key: OutputKey,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<CompressionJob>, String> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.layout.split_records == 0 {
+            return self.append_bytes(key, bytes);
+        }
+        let index = self.layout.stream_index(key)?;
+        let mut jobs = Vec::new();
+        self.advance_part(index, &mut jobs)?;
+        let mut begin = 0;
+        let mut lines = 0usize;
+        for (i, &byte) in bytes.iter().enumerate() {
+            if byte != b'\n' {
+                continue;
+            }
+            lines += 1;
+            if lines.is_multiple_of(4) {
+                self.buffers[index].records += 1;
+                if self.buffers[index].records == self.layout.split_records && i + 1 < bytes.len() {
+                    jobs.extend(self.append_bytes(key, bytes[begin..=i].to_vec())?);
+                    begin = i + 1;
+                    self.advance_part(index, &mut jobs)?;
+                }
+            }
+        }
+        if !lines.is_multiple_of(4) || bytes.last() != Some(&b'\n') {
+            return Err("Split output received an incomplete FASTQ record".into());
+        }
+        if begin == 0 {
+            jobs.extend(self.append_bytes(key, bytes)?);
+        } else {
+            jobs.extend(self.append_bytes(key, bytes[begin..].to_vec())?);
+        }
+        Ok(jobs)
+    }
+    fn advance_part(&mut self, index: usize, jobs: &mut Vec<CompressionJob>) -> Result<(), String> {
+        if self.layout.split_records > 0 && self.buffers[index].records == self.layout.split_records
+        {
+            if !self.buffers[index].bytes.is_empty() {
+                jobs.push(self.flush_index(index, CompressionFlushReason::ChunkThreshold)?);
+            }
+            self.buffers[index].part = self.buffers[index]
+                .part
+                .checked_add(1)
+                .ok_or("Split part overflow")?;
+            self.buffers[index].records = 0;
+        }
+        Ok(())
+    }
+    fn append_bytes(
         &mut self,
         key: OutputKey,
         mut bytes: Vec<u8>,
@@ -397,6 +599,11 @@ impl OutputAccumulator {
             .and_then(|value| value.checked_add(1))
             .ok_or("Serialized FASTQ record size overflow")?;
         let index = self.layout.stream_index(key)?;
+        let mut jobs = Vec::new();
+        if self.layout.split_records > 0 {
+            self.advance_part(index, &mut jobs)?;
+            self.buffers[index].records += 1;
+        }
         let accumulator = self
             .buffers
             .get_mut(index)
@@ -421,7 +628,8 @@ impl OutputAccumulator {
             .buffered_bytes
             .checked_add(record_len)
             .ok_or("Output buffer byte count overflow")?;
-        self.flush_ready(index)
+        jobs.extend(self.flush_ready(index)?);
+        Ok(jobs)
     }
 
     fn flush_ready(&mut self, appended_index: usize) -> Result<Vec<CompressionJob>, String> {
@@ -492,6 +700,8 @@ impl OutputAccumulator {
             .checked_add(1)
             .ok_or("Output chunk ID overflow")?;
         Ok(CompressionJob {
+            part: accumulator.part,
+            gzip: self.layout.gzip(key),
             key,
             chunk_id,
             fastq_bytes,

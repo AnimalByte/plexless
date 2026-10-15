@@ -9,6 +9,7 @@ use crate::samples::SampleSheet;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SampleMetrics {
     pub(crate) assigned_fragments: u64,
+    merged_fragments: u64,
     pub(crate) single_records: u64,
     pub(crate) r1_records: u64,
     pub(crate) r2_records: u64,
@@ -55,6 +56,27 @@ impl SampleQc {
             paired,
             metrics: vec![SampleMetrics::default(); sample_count],
         }
+    }
+
+    pub(crate) fn observe_merged(
+        &mut self,
+        sample_id: u32,
+        records: u64,
+        bases: u64,
+        fragments: u64,
+    ) -> Result<(), String> {
+        if !self.paired {
+            return Err("Merged metrics require paired input".into());
+        }
+        let metrics = self
+            .metrics
+            .get_mut(sample_id as usize)
+            .ok_or("Invalid merged sample ID")?;
+        metrics.assigned_fragments += fragments;
+        metrics.merged_fragments += fragments;
+        metrics.single_records += records;
+        metrics.assigned_bases_single += bases;
+        Ok(())
     }
 
     pub(crate) fn observe_output(
@@ -125,6 +147,7 @@ impl SampleQc {
                 .assigned_fragments
                 .checked_add(source.assigned_fragments)
                 .ok_or("Sample fragment count overflow")?;
+            target.merged_fragments += source.merged_fragments;
             target.single_records = target
                 .single_records
                 .checked_add(source.single_records)
@@ -166,8 +189,8 @@ impl SampleQc {
         }
         if self.paired {
             for (index, sample) in self.metrics.iter().enumerate() {
-                if sample.assigned_fragments != sample.r1_records
-                    || sample.assigned_fragments != sample.r2_records
+                if sample.assigned_fragments != sample.r1_records + sample.merged_fragments
+                    || sample.assigned_fragments != sample.r2_records + sample.merged_fragments
                 {
                     return Err(format!(
                         "Paired sample {index} has inconsistent fragment/R1/R2 counts"

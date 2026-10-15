@@ -68,7 +68,9 @@ fn advanced_output_and_qc_options_parse_human_sizes() {
         "0.02",
     ])
     .unwrap();
-    let Command::Demux(args) = cli.command;
+    let Command::Demux(args) = cli.command else {
+        panic!("expected demux")
+    };
     assert_eq!(args.output_chunk_size, ByteSizeSetting::Bytes(256 * 1024));
     assert_eq!(
         args.output_buffer_memory,
@@ -102,7 +104,9 @@ fn zero_threads_is_rejected() {
 
 #[test]
 fn output_mode_defaults_to_auto() {
-    let Command::Demux(args) = parse_demux(&[]).command;
+    let Command::Demux(args) = parse_demux(&[]).command else {
+        panic!("expected demux")
+    };
     assert_eq!(args.output_mode, OutputMode::Auto);
 }
 
@@ -113,7 +117,9 @@ fn all_output_modes_parse_and_invalid_values_fail() {
         ("direct", OutputMode::Direct),
         ("buffered", OutputMode::Buffered),
     ] {
-        let Command::Demux(args) = parse_demux(&["--output-mode", value]).command;
+        let Command::Demux(args) = parse_demux(&["--output-mode", value]).command else {
+            panic!("expected demux")
+        };
         assert_eq!(args.output_mode, expected);
     }
 
